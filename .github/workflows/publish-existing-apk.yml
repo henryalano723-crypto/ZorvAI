@@ -1,0 +1,49 @@
+name: Publish existing Zorv AI APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Build workflow run containing the APK artifact
+        required: true
+      tag:
+        description: Release tag
+        required: true
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK artifact from build run
+        uses: actions/download-artifact@v4
+        with:
+          name: zorv-ai-patched-full-debug
+          path: downloaded
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare direct-download APK
+        shell: bash
+        run: |
+          mkdir -p dist
+          src="$(find downloaded -type f -name '*.apk' -print -quit)"
+          test -n "$src"
+          cp "$src" dist/ZorvAI-v1.0.62-openai128-huawei-tts-fix.apk
+          sha256sum dist/*.apk
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          gh release create "$TAG" \
+            dist/ZorvAI-v1.0.62-openai128-huawei-tts-fix.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target fix/openai-tool-limit \
+            --title "Zorv AI OpenAI 128 + Huawei TTS fix" \
+            --notes "Fixes OpenAI's 128-tool request limit and Huawei/Android system TTS initialization. Test-signed APK: uninstall/export the official-signed build before installing if Android reports a signature conflict."
