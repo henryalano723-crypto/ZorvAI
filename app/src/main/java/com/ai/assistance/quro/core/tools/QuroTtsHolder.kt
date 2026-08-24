@@ -1,9 +1,11 @@
 package com.ai.assistance.quro.core.tools
 
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
@@ -208,12 +210,21 @@ object QuroTtsHolder {
                     }
                 }
 
-                // 第 2 次起尝试用系统默认引擎显式绑定，规避默认引擎解析偶发失败
-                instance = if (attempt >= 2) {
-                    val eng = runCatching {
-                        val m = TextToSpeech::class.java.getDeclaredMethod("getDefaultEngine")
-                        m.invoke(null) as? String
+                // 第 2 次起显式绑定系统默认 TTS 引擎。
+                // TextToSpeech 并没有可用的静态 getDefaultEngine() API，旧的反射代码在华为/部分 OEM
+                // 上始终得到 null，重试实际仍在走同一条失败路径。
+                val eng = when (attempt) {
+                    1 -> null
+                    2 -> runCatching {
+                        Settings.Secure.getString(ctx.contentResolver, Settings.Secure.TTS_DEFAULT_SYNTH)
                     }.getOrNull()
+                    else -> runCatching {
+                        ctx.packageManager.queryIntentServices(
+                            Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), 0
+                        ).firstOrNull()?.serviceInfo?.packageName
+                    }.getOrNull()
+                }
+                instance = if (attempt >= 2) {
                     if (!eng.isNullOrBlank()) {
                         log("【OnInit#$attempt】尝试显式引擎: $eng")
                         TextToSpeech(ctx, listener, eng)
@@ -223,6 +234,11 @@ object QuroTtsHolder {
                 } else {
                     TextToSpeech(ctx, listener)
                 }
+
+                // 某些 OEM 实现可能在构造期间很快回调 OnInit。旧代码只在回调内赋值，
+                // 此时 instance 仍可能为 null，导致 status=SUCCESS 但后续永远无可用 TTS 实例。
+                // 构造器返回后再保底保存一次，同时兼容普通异步回调。
+                tts = instance
 
                 log("TextToSpeech(ctx) 构造器已返回 (#$attempt)")
 
