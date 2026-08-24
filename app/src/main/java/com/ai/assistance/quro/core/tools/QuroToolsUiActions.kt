@@ -15,7 +15,8 @@ import com.ai.assistance.quro.core.cards.QuroChatCard
  * - `ui_open_<surface>`：打开某个全屏界面或底部弹层（如 ui_open_onlyoffice）
  * - `ui_toggle_<switch>`：切换某个开关（如 ui_toggle_deepthink）
  * - `ui_clear_chat` / `ui_new_chat`：清空 / 新建对话
- * 全部进入 [coreSpecs] 默认下发集，并由 [appendCapabilityAwareness] 自动带进系统提示词（同源）。
+ * 核心模式通过单个 [uiActionDispatcherTool] 统一分发，避免 32 个动作各占一个模型工具名；
+ * 完整模式仍保留全部独立工具，兼容原有调用方式。
  */
 object QuroUiActionBridge {
     /** 由 ChatScreen 注入：action -> 在 UI 层执行对应打开/切换。未连接时工具返回提示。 */
@@ -98,8 +99,45 @@ private class UiActionTool(private val spec: UiActionSpec) : QuroTool {
     }
 }
 
+/**
+ * 核心工具集使用的 UI 动作统一入口。
+ *
+ * OpenAI 单次请求最多接受 128 个 tools。原先把 32 个 UI 动作分别放入核心集时，
+ * 核心工具总数会从 126 增长到 158。这里用一个 action 参数承载全部动作，功能不减少，
+ * 但模型侧只占用一个工具定义。
+ */
+private class UiActionDispatcherTool : QuroTool {
+    override val name = "ui_action"
+    override val description = buildString {
+        append("打开或控制 Zorv AI 内部界面。根据用户意图选择 action。支持：")
+        append(UI_ACTIONS.joinToString(", ") { "${it.action}(${it.label})" })
+    }
+    override val parametersJson = """{
+        "type":"object",
+        "properties":{
+            "action":{"type":"string","description":"要执行的 UI 动作名，例如 ui_open_model_config"},
+            "note":{"type":"string","description":"可选备注，说明为何执行"}
+        },
+        "required":["action"]
+    }""".trimIndent()
+
+    override fun run(context: Context, arguments: String): String {
+        val action = runCatching { org.json.JSONObject(arguments).optString("action") }
+            .getOrDefault("")
+        val spec = UI_ACTIONS.firstOrNull { it.action == action }
+            ?: return "未知 UI 动作：$action。可先查看 ui_action 的 action 参数说明。"
+        val dispatch = QuroUiActionBridge.dispatch
+            ?: return "UI 动作桥未连接（对话框未就绪，无法打开界面）"
+        dispatch(spec.action)
+        return "已执行 UI 动作：${spec.label}"
+    }
+}
+
 /** 全部 UI 动作工具实例（供 [buildQuroRegistry] 注册）。 */
 val allUiActionTools: List<QuroTool> = UI_ACTIONS.map { UiActionTool(it) }
+
+/** 核心模式统一分发工具；32 个独立动作仍由 [allUiActionTools] 保留给完整模式。 */
+val uiActionDispatcherTool: QuroTool = UiActionDispatcherTool()
 
 /** UI 动作工具名集合（供 [QuroToolRegistry.coreSpecs] 纳入默认下发集）。 */
 fun uiActionToolNames(): Set<String> = UI_ACTIONS.map { it.action }.toSet()

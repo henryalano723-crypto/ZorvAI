@@ -381,7 +381,9 @@ fun buildQuroRegistry(context: Context? = null): QuroToolRegistry {
     r.register(VideoUnderstandingTool()) // AI 视频理解
     // 增强版文档创建工具：支持更多类型和更好渲染
     r.register(EnhancedDocTool())        // 增强版文档创建
-    // UI 动作工具：把对话框界面/弹层/开关注册为 AI 可调用工具（走 QuroUiActionBridge 回调 ChatScreen）
+    // 核心模式用一个分发入口承载全部 UI 动作，避免模型 tools 数组超过 OpenAI 的 128 上限。
+    r.register(uiActionDispatcherTool)
+    // 完整模式仍注册全部独立动作，兼容原有工具名与调用方式。
     allUiActionTools.forEach { r.register(it) }
     // 对话框富卡片工具：AI 下发可交互卡片（待办/图表/笔记/动作）
     r.register(UiCardTool())
