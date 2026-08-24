@@ -150,6 +150,8 @@ class QuroToolRegistry {
             "ui_card",
             // 对话框内联 UI 组件（v134：按钮/开关/滑块/进度/统计/提醒/表格/列表/分段/饼图/评分/倒计时/标签页/折叠/表单/标签/步骤/仪表/媒体/信息）
             "ui_widget",
+            // Zorv 内部界面动作统一入口：一个工具通过 action 参数承载全部 32 个动作
+            "ui_action",
             // MCP 客户端：AI 调用外部 MCP 服务器工具（#402）
             "mcp_servers", "mcp_list_tools", "mcp_call", "mcp_deploy", "mcp_undeploy", "mcp_list_local",
             // MCP-ACI 桥接：通过 ACI 调用外部 MCP 服务器工具
@@ -181,7 +183,9 @@ class QuroToolRegistry {
             "root_exec", "root_status",
             "linux_run", "linux_install", "linux_start", "linux_stop", "linux_status",
             // terminal_run/terminal_exec 为应用沙盒内免权限 shell（Runtime.exec /system/bin/sh）
-        ) + uiActionToolNames() // 并入「UI 动作工具」：对话框界面/弹层/开关 → AI 可调用（见 QuroToolsUiActions）
+        )
+        // 32 个 ui_open_*/ui_toggle_* 不再逐个并入核心集：它们由 ui_action 统一分发，
+        // 功能全部保留，同时把 32 个模型工具定义压缩成 1 个。
         val base = map.values.filter { it.name in coreNames }.map {
             QuroToolSpec(it.name, it.description, it.parametersJson)
         }
@@ -189,7 +193,9 @@ class QuroToolRegistry {
         val imported = QuroImportedToolRegistry.all().map {
             QuroToolSpec(it.name, it.description, it.parametersJson)
         }
-        return (base + imported).plus(skillSpecs()).distinctBy { it.name }
+        // 核心模式必须满足 OpenAI Chat Completions 的最大 128 工具限制。
+        // base 优先，所以截断时不会丢失点击、滑动、读屏、输入、打开 App 等核心能力。
+        return (base + imported).plus(skillSpecs()).distinctBy { it.name }.take(128)
     }
 
     /** 完整工具规格（全部内置工具 + 技能工具）。仅在 API 代理确认支持时使用（见 coreSpecs 说明）。 */
