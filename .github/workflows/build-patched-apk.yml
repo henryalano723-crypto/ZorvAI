@@ -1,0 +1,72 @@
+name: Build patched Zorv AI APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout full source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android and native build packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;27.0.12077973" \
+            "cmake;3.22.1"
+
+      - name: Create temporary CI signing key
+        shell: bash
+        run: |
+          keytool -genkeypair -v \
+            -keystore ci-keystore.jks \
+            -storepass android \
+            -alias zorv-ci \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 3650 \
+            -dname "CN=Zorv CI,OU=Test,O=Local,L=Local,S=Local,C=CN"
+          printf '%s\n' \
+            'storeFile=../ci-keystore.jks' \
+            'storePassword=android' \
+            'keyAlias=zorv-ci' \
+            'keyPassword=android' > keystore.properties
+
+      - name: Build full debug APK
+        run: gradle :app:assembleFullDebug --stacktrace --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: zorv-ai-patched-full-debug
+          path: app/build/outputs/apk/full/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
