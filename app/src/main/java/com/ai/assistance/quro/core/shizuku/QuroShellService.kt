@@ -33,7 +33,7 @@ class QuroShellService : IQuroShellService.Stub() {
      * 在 Shizuku 特权进程中执行 shell 命令。
      *
      * @param command 要执行的命令（如 "id"、"pm list packages"、"dumpsys activity top"）
-     * @return stdout 内容（非空时）；否则 stderr 内容；均空则 "(无输出)"
+     * @return 统一的 `exit=<code>\n<body>` 结果，和反射执行路径保持一致。
      */
     override fun exec(command: String): String {
         return try {
@@ -44,7 +44,7 @@ class QuroShellService : IQuroShellService.Stub() {
             val exitCode = process.waitFor()
             val body = (out + err).trim()
             Log.d(TAG, "exec result: exit=$exitCode body=${body.take(120)}")
-            if (body.isBlank()) "(无输出)" else body
+            "exit=$exitCode\n${if (body.isBlank()) "(无输出)" else body}"
         } catch (e: Exception) {
             Log.e(TAG, "exec failed", e)
             "Error: ${e.message}"

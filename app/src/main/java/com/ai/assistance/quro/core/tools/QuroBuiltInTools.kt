@@ -198,6 +198,7 @@ fun buildQuroRegistry(context: Context? = null): QuroToolRegistry {
     r.register(LaunchAppTool())
     r.register(SearchAndLaunchAppTool())
     r.register(GetPackageNameTool())
+    r.register(StopAppTool())
     r.register(GetNotificationsTool())
     r.register(GetBluetoothTool())
     r.register(ToggleFlashlightTool())

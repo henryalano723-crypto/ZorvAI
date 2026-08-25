@@ -1,6 +1,8 @@
 package com.ai.assistance.quro.core.tools
 
 import com.ai.assistance.quro.core.QuroBrowserBridge
+import com.ai.assistance.quro.core.shizuku.QuroShizuku
+import com.ai.assistance.quro.core.shizuku.QuroShizukuPkg
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
@@ -255,6 +257,100 @@ class GetPackageNameTool : QuroTool {
         if (appName.isEmpty()) return "缺少 app_name 参数"
         val target = findAppByName(context, appName) ?: return "未找到名为「$appName」的应用"
         return "${target.label} 的包名是：${target.packageName}"
+    }
+}
+
+/**
+ * 强制停止应用（应用显示名或包名均可）。
+ *
+ * 用户口语中的“关闭微信/千问/QQ”不应要求其自行查询包名；工具内部复用
+ * PackageManager 的通用名称解析，再通过 Shizuku shell 执行 am force-stop。
+ */
+class StopAppTool : QuroTool {
+    override val name = "stop_app"
+    override val description =
+        "关闭并停止指定应用。直接传应用显示名（如千问、微信、QQ）即可自动查找包名；也支持精确包名。用户说关闭/停止/结束某应用时优先调用。需要 Shizuku。"
+    override val parametersJson = """{
+        "type":"object",
+        "properties":{
+            "app_name":{"type":"string","description":"应用显示名，如「千问」「微信」"},
+            "package_name":{"type":"string","description":"应用包名（可选，已知时可直接填写）"}
+        }
+    }"""
+
+    override fun run(context: Context, arguments: String): String {
+        if (!QuroShizuku.isReady) {
+            return "❌ Shizuku 未就绪：请确认 Shizuku 正在运行并已授权 Zorv AI"
+        }
+
+        val args = JSONObject(arguments)
+        val requestedPackage = args.optString("package_name", "").trim()
+        val requestedName = args.optString("app_name", "").trim()
+        if (requestedPackage.isEmpty() && requestedName.isEmpty()) {
+            return "❌ 缺少 app_name 或 package_name"
+        }
+
+        val packageTarget = if (requestedPackage.isNotEmpty()) {
+            if (!requestedPackage.matches(Regex("[A-Za-z0-9._]+"))) {
+                return "❌ 包名格式不合法"
+            }
+            val label = runCatching {
+                val info = context.packageManager.getApplicationInfo(requestedPackage, 0)
+                context.packageManager.getApplicationLabel(info).toString()
+            }.getOrElse { return "❌ 未安装该应用：$requestedPackage" }
+            AppMatch(requestedPackage, label)
+        } else {
+            null
+        }
+
+        // 停止应用是破坏性动作：仅接受精确名称，或唯一的包含匹配；多个候选时不猜。
+        val nameTarget = if (requestedName.isNotEmpty()) {
+            val q = requestedName.lowercase()
+            val candidates = context.packageManager
+                .getInstalledApplications(PackageManager.GET_META_DATA)
+                .map { AppMatch(it.packageName, context.packageManager.getApplicationLabel(it).toString()) }
+                .filter { it.label.lowercase().contains(q) || it.packageName.lowercase().contains(q) }
+                .sortedBy { it.label }
+            val exact = candidates.filter {
+                it.label.equals(requestedName, ignoreCase = true) ||
+                    it.packageName.equals(requestedName, ignoreCase = true)
+            }
+            when {
+                exact.size == 1 -> exact.first()
+                exact.size > 1 -> return "❌ 找到多个同名应用，请改用精确包名：${exact.joinToString { "${it.label}(${it.packageName})" }}"
+                candidates.size == 1 -> candidates.first()
+                candidates.isEmpty() -> return "❌ 未找到匹配「$requestedName」的已安装应用"
+                else -> return "❌ 「$requestedName」匹配多个应用，请说得更准确：${candidates.take(8).joinToString { "${it.label}(${it.packageName})" }}"
+            }
+        } else {
+            null
+        }
+
+        if (packageTarget != null && nameTarget != null && packageTarget.packageName != nameTarget.packageName) {
+            return "❌ app_name 与 package_name 指向不同应用，已拒绝执行"
+        }
+        val target = packageTarget ?: nameTarget ?: return "❌ 未找到目标应用"
+
+        if (target.packageName == context.packageName) {
+            return "❌ 为避免中断当前任务，Zorv AI 不能停止自身"
+        }
+        if (target.packageName in setOf(
+                "android",
+                "com.android.systemui",
+                QuroShizukuPkg.MAIN,
+                QuroShizukuPkg.LEGACY
+            )
+        ) {
+            return "❌ 拒绝停止关键系统服务：${target.label}"
+        }
+
+        val userId = android.os.Process.myUserHandle().identifier
+        val result = QuroShizuku.exec("am force-stop --user $userId ${target.packageName}")
+        return if (result.contains("exit=0")) {
+            "✅ 已关闭 ${target.label}（${target.packageName}）"
+        } else {
+            "❌ 关闭 ${target.label} 失败：$result"
+        }
     }
 }
 

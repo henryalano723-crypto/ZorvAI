@@ -110,7 +110,7 @@ class QuroToolRegistry {
             "get_battery", "get_wifi_info", "get_network_info", "get_sensors", "vibrate",
             "get_clipboard", "set_clipboard",
             // 应用管理
-            "list_installed_apps", "launch_app", "search_and_launch_app", "get_package_name",
+            "list_installed_apps", "launch_app", "search_and_launch_app", "stop_app",
             "list_app_functions", "invoke_app_function",
             // 通知 / 蓝牙 / 手电（注意：真实注册名是 get_active_notifications，coreNames 必须与之一致，否则工具会被静默丢弃）
             "get_active_notifications", "get_bluetooth_status", "toggle_flashlight",
@@ -131,7 +131,7 @@ class QuroToolRegistry {
             // 广义 IDE 集成（图形/视频/音频/3D/游戏/低代码/代码 IDE）
             "creative_studio",
             // 终端（应用沙盒内 PTY / shell，免权限，无 root/Shizuku）
-            "terminal_run", "terminal_exec", "terminal_write", "terminal_kill", "terminal_status", "quroterm_exec",
+            "terminal_run", "terminal_exec", "terminal_write", "terminal_kill", "quroterm_exec",
             // TTS
             "speak", "stop_speak",
             // 闹钟
@@ -201,7 +201,8 @@ class QuroToolRegistry {
     }
 
     /** 完整工具规格（全部内置工具 + 技能工具）。仅在 API 代理确认支持时使用（见 coreSpecs 说明）。 */
-    fun fullSpecs(): List<QuroToolSpec> = specs().plus(skillSpecs()).distinctBy { it.name }
+    fun fullSpecs(): List<QuroToolSpec> =
+        specs().plus(skillSpecs()).distinctBy { it.name }.take(128)
 
     /**
      * 技能工具规格：把「可调用」的用户技能注册为 function-calling 工具下发。
