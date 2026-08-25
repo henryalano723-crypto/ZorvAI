@@ -246,7 +246,7 @@ fun QuroAboutScreen(onBack: () -> Unit = {}) {
             Triple("android-image-cropper", "Apache-2.0", "Vanniktech - 图片裁剪组件"),
             Triple("Apache Commons Compress", "Apache-2.0", "Apache 软件基金会 - 压缩文件处理"),
             Triple("QuickJS", "MIT", "Fabrice Bellard - 轻量级 JavaScript 引擎，用于插件运行时"),
-            Triple("Sherpa-NCNN", "Apache-2.0 / BSD-3", "k2-fsa - 端侧语音识别引擎（SenseVoice）"),
+            Triple("Sherpa-NCNN / Sherpa-ONNX", "Apache-2.0 / BSD-3", "k2-fsa - 端侧离线语音识别引擎"),
             Triple("GeckoView", "MPL-2.0", "Mozilla - 开源浏览器引擎，文件级 Copyleft，源码随包提供"),
             Triple("org.json", "Public Domain", "公共领域 - 自 20220924 版本起移除 \"Good, not Evil\" 条款"),
             Triple("Health Connect", "Apache-2.0", "Google - 健康数据连接客户端"),

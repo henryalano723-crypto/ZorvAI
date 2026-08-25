@@ -10,6 +10,14 @@ import android.os.Message
 import android.os.Messenger
 import android.util.Log
 import com.k2fsa.sherpa.ncnn.SherpaNcnn
+import com.k2fsa.sherpa.onnx.OfflineModelConfig
+import com.k2fsa.sherpa.onnx.OfflineRecognizer
+import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
+import com.k2fsa.sherpa.onnx.OfflineSenseVoiceModelConfig
+import com.k2fsa.sherpa.onnx.OnlineModelConfig
+import com.k2fsa.sherpa.onnx.OnlineParaformerModelConfig
+import com.k2fsa.sherpa.onnx.OnlineRecognizer
+import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -68,6 +76,8 @@ class QuroAsrService : Service() {
     }
 
     @Volatile private var recognizer: SherpaNcnn? = null
+    @Volatile private var offlineOnnxRecognizer: OfflineRecognizer? = null
+    @Volatile private var onlineOnnxRecognizer: OnlineRecognizer? = null
 
     /** 引擎专用线程：原生解码耗时，绝不能占用 Binder 回复所在的主线程。 */
     private lateinit var engineThread: HandlerThread
@@ -122,6 +132,12 @@ class QuroAsrService : Service() {
         // 先释放旧实例，避免切换模型时两份 ncnn 权重同时常驻（手机内存敏感）
         releaseRecognizer()
 
+        val declared = typeName?.let { runCatching { AsrModelType.valueOf(it) }.getOrNull() }
+        if (declared == AsrModelType.ONNX_SENSE_VOICE ||
+            declared == AsrModelType.ONNX_STREAMING_PARAFORMER) {
+            return loadOnnxModel(File(dir), declared, threads)
+        }
+
         if (!SherpaNcnn.nativeLoaded) {
             val err = SherpaNcnn.nativeLoadError.ifEmpty { "端侧识别原生库未加载" }
             Log.e(TAG, "原生库不可用：$err")
@@ -132,13 +148,14 @@ class QuroAsrService : Service() {
         val modelDir = File(dir)
         if (!modelDir.isDirectory) return false to "模型目录不存在：$dir"
 
-        val declared = typeName?.let { runCatching { AsrModelType.valueOf(it) }.getOrNull() }
         if (declared == AsrModelType.SENSE_VOICE_LEGACY) {
             return false to "已部署的是旧版 SenseVoice 模型，当前引擎不支持（引擎内无对应实现）。请到「语音识别」设置里重新下载推荐的流式模型。"
         }
 
         when (detectAsrLayout(modelDir)) {
             AsrModelLayout.TRANSDUCER -> Unit
+            AsrModelLayout.ONNX_SENSE_VOICE, AsrModelLayout.ONNX_STREAMING_PARAFORMER ->
+                return false to "模型是 ONNX 格式，但部署记录仍标为 NCNN；请在模型列表重新选择该模型。"
             AsrModelLayout.ONNX_LEGACY ->
                 return false to "模型目录里是 ONNX 格式模型，与本机 NCNN 引擎不兼容，请重新下载 Sherpa-NCNN 流式模型。"
             AsrModelLayout.SENSE_VOICE_LEGACY ->
@@ -171,6 +188,58 @@ class QuroAsrService : Service() {
         }
     }
 
+    /** 加载新 Sherpa-ONNX 引擎；与旧 NCNN 引擎并存但同一时刻只保留一个模型。 */
+    private fun loadOnnxModel(modelDir: File, type: AsrModelType, threads: Int): Pair<Boolean, String> {
+        if (!modelDir.isDirectory) return false to "模型目录不存在：${modelDir.absolutePath}"
+        val files = findOnnxAsrFiles(modelDir, type)
+            ?: return false to "ONNX 模型文件不完整，请删除后重新下载。"
+        return try {
+            when (type) {
+                AsrModelType.ONNX_SENSE_VOICE -> {
+                    val modelConfig = OfflineModelConfig(
+                        senseVoice = OfflineSenseVoiceModelConfig(
+                            model = files.model,
+                            language = "zh",
+                            useInverseTextNormalization = true,
+                        ),
+                        numThreads = threads.coerceIn(1, 4),
+                        tokens = files.tokens,
+                        modelType = "sense_voice",
+                    )
+                    offlineOnnxRecognizer = OfflineRecognizer(
+                        assetManager = null,
+                        config = OfflineRecognizerConfig(modelConfig = modelConfig),
+                    )
+                }
+                AsrModelType.ONNX_STREAMING_PARAFORMER -> {
+                    val modelConfig = OnlineModelConfig(
+                        paraformer = OnlineParaformerModelConfig(
+                            encoder = files.encoder,
+                            decoder = files.decoder,
+                        ),
+                        tokens = files.tokens,
+                        numThreads = threads.coerceIn(1, 4),
+                        modelType = "paraformer",
+                    )
+                    onlineOnnxRecognizer = OnlineRecognizer(
+                        assetManager = null,
+                        config = OnlineRecognizerConfig(
+                            modelConfig = modelConfig,
+                            enableEndpoint = false,
+                        ),
+                    )
+                }
+                else -> return false to "不支持的 ONNX 模型类型：$type"
+            }
+            Log.i(TAG, "Sherpa-ONNX 模型加载成功 ✅ type=$type threads=$threads")
+            true to ""
+        } catch (e: Throwable) {
+            Log.e(TAG, "Sherpa-ONNX 模型加载失败: ${e.message}", e)
+            releaseRecognizer()
+            false to "ONNX 模型加载失败：${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
     /**
      * 流式识别一整段 16-bit PCM（16kHz 单声道 little-endian）。
      *
@@ -181,6 +250,8 @@ class QuroAsrService : Service() {
      * @return first = 识别文本，second = 失败原因（成功为空串）
      */
     private fun doRecognize(pcm: ByteArray): Pair<String, String> {
+        offlineOnnxRecognizer?.let { return doOfflineOnnxRecognize(it, pcm) }
+        onlineOnnxRecognizer?.let { return doOnlineOnnxRecognize(it, pcm) }
         val rec = recognizer ?: return "" to "端侧引擎未就绪，请先在设置里下载并部署模型。"
         if (pcm.size < 2) return "" to "没有采集到音频数据。"
 
@@ -241,6 +312,63 @@ class QuroAsrService : Service() {
         }
     }
 
+    private fun doOfflineOnnxRecognize(rec: OfflineRecognizer, pcm: ByteArray): Pair<String, String> {
+        if (pcm.size < 2) return "" to "没有采集到音频数据。"
+        return try {
+            val stream = rec.createStream()
+            try {
+                stream.acceptWaveform(pcmToFloat(pcm), SAMPLE_RATE.toInt())
+                rec.decode(stream)
+                val text = rec.getResult(stream).text.trim()
+                if (text.isEmpty()) "" to "没有识别到有效语音。" else text to ""
+            } finally {
+                stream.release()
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "SenseVoice 识别失败: ${e.message}", e)
+            "" to "SenseVoice 识别失败：${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
+    private fun doOnlineOnnxRecognize(rec: OnlineRecognizer, pcm: ByteArray): Pair<String, String> {
+        if (pcm.size < 2) return "" to "没有采集到音频数据。"
+        return try {
+            val samples = pcmToFloat(pcm)
+            val stream = rec.createStream()
+            try {
+                var offset = 0
+                var steps = 0
+                while (offset < samples.size) {
+                    val n = minOf(CHUNK_SAMPLES, samples.size - offset)
+                    stream.acceptWaveform(samples.copyOfRange(offset, offset + n), SAMPLE_RATE.toInt())
+                    offset += n
+                    while (rec.isReady(stream)) {
+                        rec.decode(stream)
+                        if (++steps > MAX_DECODE_STEPS) return "" to "Paraformer 解码超时。"
+                    }
+                }
+                stream.inputFinished()
+                while (rec.isReady(stream)) {
+                    rec.decode(stream)
+                    if (++steps > MAX_DECODE_STEPS) break
+                }
+                val text = rec.getResult(stream).text.trim()
+                if (text.isEmpty()) "" to "没有识别到有效语音。" else text to ""
+            } finally {
+                stream.release()
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Paraformer 识别失败: ${e.message}", e)
+            "" to "Paraformer 识别失败：${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
+    private fun pcmToFloat(pcm: ByteArray): FloatArray {
+        val shorts = ShortArray(pcm.size / 2)
+        ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shorts)
+        return FloatArray(shorts.size) { shorts[it] / 32768.0f }
+    }
+
     /**
      * 拼接分句结果：段间默认用空格分隔（保护英文单词边界），
      * 但两侧都是中日韩文字时去掉空格，避免出现「今天 天气 不错」这种断裂感。
@@ -255,6 +383,12 @@ class QuroAsrService : Service() {
         val old = recognizer
         recognizer = null
         try { old?.release() } catch (_: Throwable) {}
+        val oldOffline = offlineOnnxRecognizer
+        offlineOnnxRecognizer = null
+        try { oldOffline?.release() } catch (_: Throwable) {}
+        val oldOnline = onlineOnnxRecognizer
+        onlineOnnxRecognizer = null
+        try { oldOnline?.release() } catch (_: Throwable) {}
     }
 
     override fun onBind(intent: Intent?): IBinder = messenger.binder

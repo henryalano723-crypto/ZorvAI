@@ -124,7 +124,7 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
     var selectedSpecId by remember { mutableStateOf(QuroOnDeviceModelPrefs.getSelectedSpecId(ctx)) }
     var customMode by remember { mutableStateOf(QuroOnDeviceModelPrefs.getCustomMode(ctx)) }
     var customLink by remember { mutableStateOf(QuroOnDeviceModelPrefs.getCustomLink(ctx)) }
-    // 自定义链接的模型类型：当前引擎只跑流式 transducer，保留下拉仅为将来扩展
+    // 自定义链接的模型类型：支持旧 NCNN 流式模型及新 Sherpa-ONNX 模型。
     var customType by remember { mutableStateOf(AsrModelType.STREAMING_TRANSDUCER) }
     var downloading by remember { mutableStateOf(false) }
     var dlDownloaded by remember { mutableStateOf(0L) }
@@ -134,7 +134,7 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
     var deployedName by remember { mutableStateOf(QuroOnDeviceModelPrefs.getDeployedName(ctx)) }
     /** 已部署模型占用的磁盘空间，用户最关心的「到底吃我多少存储」。 */
     var deployedSize by remember { mutableStateOf(0L) }
-    /** 已部署目录是本机引擎跑不动的旧模型（SenseVoice / ONNX）。 */
+    /** 已部署目录是无法判型或缺少必要文件的历史模型。 */
     var legacyDeployed by remember { mutableStateOf(false) }
     var specMenu by remember { mutableStateOf(false) }
     var customTypeMenu by remember { mutableStateOf(false) }
@@ -414,7 +414,7 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
         }
         if (QuroOnDeviceModelManager.isLegacyIncompatible(ctx)) {
             testStatus = "已部署的是旧模型，引擎跑不了 ❌"
-            addLog("❌ 当前部署的是旧版模型（SenseVoice / ONNX），本机引擎无对应实现——这正是此前「端侧识别一直没反应」的根因。请删除后重新下载推荐模型。")
+            addLog("❌ 当前部署的是无法识别类型或缺少必要文件的历史模型。请删除后重新下载推荐模型。")
             return
         }
         if (!QuroOnDeviceAsr.isModelAvailable(ctx)) {
@@ -695,7 +695,7 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
             Modifier.padding(padding).padding(16.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("语音转文字配置，设置后悬浮语音球的识别语言生效。可切换「本地识别 / AI 模型 / 本地模型（端侧）」引擎；本地模型为手机离线运行的 Sherpa-NCNN 流式模型，最小 22MB，说完自动断句。", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
+            Text("语音转文字配置，设置后悬浮语音球的识别语言生效。可切换「本地识别 / AI 模型 / 本地模型（端侧）」引擎；端侧模型全部在手机离线运行，支持中文增强 SenseVoice、流式 Paraformer 和轻量 NCNN 模型。", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
             HorizontalDivider()
 
             // ── 识别引擎选择 ───────────────────────────────────────────────
@@ -744,7 +744,7 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
                         Spacer(Modifier.width(8.dp))
                         Column(Modifier.weight(1f)) {
                             Text("AI 模型", style = MaterialTheme.typography.bodyMedium)
-                            Text("使用对话中已配置的 AI 模型转写（Phase 2 开放）", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
+                            Text("使用对话中已配置、支持音频输入或转写接口的 AI 模型", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
                         }
                     }
                     HorizontalDivider()
@@ -765,7 +765,7 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
                         Spacer(Modifier.width(8.dp))
                         Column(Modifier.weight(1f)) {
                             Text("本地模型（端侧）", style = MaterialTheme.typography.bodyMedium)
-                            Text("手机离线运行 Sherpa-NCNN 流式模型，22MB 起、低延迟、说完自动断句", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
+                            Text("手机离线运行；可选中文增强 SenseVoice、流式 Paraformer 或轻量 NCNN", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
                         }
                     }
                 }
@@ -775,7 +775,7 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
             if (source == QuroSttPrefs.SOURCE_ONDEVICE) {
                 ChapterLabel("02", "端侧模型下载与部署")
                 Text(
-                    "手机离线运行的模型需先下载。内置全部为流式 transducer（encoder/decoder/joiner 三件套），已按手机适配程度排序，第一项即推荐项。下载后自动解压部署并立即可用。",
+                    "手机离线模型需先下载。推荐 SenseVoiceSmall 中文增强模型；也可选中英流式 Paraformer 或轻量 NCNN。下载后自动解压部署并立即可用。",
                     style = MaterialTheme.typography.bodySmall,
                     color = cs.onSurfaceVariant,
                 )
@@ -809,13 +809,12 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
                             tone = if (deployStatus == QuroOnDeviceModelPrefs.STATUS_DEPLOYED) Sage else cs.onSurfaceVariant,
                         )
 
-                        // 历史遗留部署迁移提示：旧 SenseVoice / ONNX 目录本机引擎跑不了，
-                        // 这正是用户此前「端侧识别一直没反应」的根因，必须显式告知而不是静默失败。
+                        // 历史遗留部署迁移提示：无法判型或缺少必要文件时明确提示。
                         if (legacyDeployed) {
                             val warnColor = Color(android.graphics.Color.parseColor("#C0432F"))
                             InfoBox(
-                                text = "⚠️ 当前部署的是旧版模型（SenseVoice / ONNX），本机引擎没有对应实现，识别会一直没反应。" +
-                                    "请点「删除模型」后重新下载上方推荐模型（约 22MB）。",
+                                text = "⚠️ 当前部署目录无法识别模型类型，或缺少必要文件，识别会没有反应。" +
+                                    "请点「删除模型」后重新下载上方推荐模型。",
                                 tone = warnColor,
                             )
                         }
@@ -849,7 +848,7 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
                             }
                             HorizontalDivider()
                             DropdownMenuItem(
-                                text = { Text("➕ 自定义链接（需为 Sherpa-NCNN 流式模型）", style = MaterialTheme.typography.bodyMedium) },
+                                text = { Text("➕ 自定义链接（NCNN / Sherpa-ONNX）", style = MaterialTheme.typography.bodyMedium) },
                                 onClick = { selectSpec("", true) },
                             )
                         }
@@ -869,8 +868,11 @@ fun QuroSttSettingsScreen(onBack: () -> Unit = {}) {
                                 onClick = { customTypeMenu = true },
                             )
                             DropdownMenu(expanded = customTypeMenu, onDismissRequest = { customTypeMenu = false }) {
-                                // 只列出引擎真正能跑的类型：随包 .so 仅实现流式 transducer
-                                listOf(AsrModelType.STREAMING_TRANSDUCER).forEach { t ->
+                                listOf(
+                                    AsrModelType.ONNX_SENSE_VOICE,
+                                    AsrModelType.ONNX_STREAMING_PARAFORMER,
+                                    AsrModelType.STREAMING_TRANSDUCER,
+                                ).forEach { t ->
                                     DropdownMenuItem(
                                         text = { Text(t.label, style = MaterialTheme.typography.bodyMedium) },
                                         onClick = { customType = t; customTypeMenu = false; QuroOnDeviceModelPrefs.setCustomType(ctx, t.name) },

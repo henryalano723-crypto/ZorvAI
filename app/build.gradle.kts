@@ -7,6 +7,14 @@ val keystoreProperties = Properties()
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(keystorePropertiesFile.inputStream())
 }
+val zorvStoreFile = keystoreProperties.getProperty("storeFile")
+    ?: System.getenv("ZORV_STORE_FILE")
+val zorvStorePassword = keystoreProperties.getProperty("storePassword")
+    ?: System.getenv("ZORV_STORE_PASSWORD")
+val zorvKeyAlias = keystoreProperties.getProperty("keyAlias")
+    ?: System.getenv("ZORV_KEY_ALIAS")
+val zorvKeyPassword = keystoreProperties.getProperty("keyPassword")
+    ?: System.getenv("ZORV_KEY_PASSWORD")
 
 plugins {
     alias(libs.plugins.android.application)
@@ -22,10 +30,10 @@ android {
     signingConfigs {
         // 使用 keystore.properties 中配置的签名证书
         create("release") {
-            storeFile = file(keystoreProperties["storeFile"] as String)
-            storePassword = keystoreProperties["storePassword"] as String
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["keyPassword"] as String
+            if (!zorvStoreFile.isNullOrBlank()) storeFile = file(zorvStoreFile)
+            storePassword = zorvStorePassword
+            keyAlias = zorvKeyAlias
+            keyPassword = zorvKeyPassword
             storeType = "PKCS12"
             // 启用 V1+V2 签名：V1 签名兼容旧安装器，V2 签名提供更好的安全性
             // version-control-info 已被禁用，不会污染 V1 签名链
@@ -41,8 +49,8 @@ android {
         targetSdk = 34
         // Stable patched builds use a monotonic date-based code so Android/Huawei
         // treats every tested APK as an upgrade over official and earlier patches.
-        versionCode = 2026082503
-        versionName = "1.0.63-patched.20260825.3"
+        versionCode = 2026082504
+        versionName = "1.0.63-patched.20260825.4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
