@@ -38,8 +38,10 @@ android {
         applicationId = "com.ai.assistance.quro"
         minSdk = 26
         targetSdk = 34
-        versionCode = 500
-        versionName = "1.0.62"
+        // Patched builds use a monotonic date-based code so Android/Huawei treats each
+        // tested APK as an upgrade instead of an equal/older package.
+        versionCode = 2026082501
+        versionName = "1.0.63-patched.20260825.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
