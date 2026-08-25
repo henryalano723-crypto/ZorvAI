@@ -40,8 +40,8 @@ android {
         targetSdk = 34
         // Patched builds use a monotonic date-based code so Android/Huawei treats each
         // tested APK as an upgrade instead of an equal/older package.
-        versionCode = 2026082501
-        versionName = "1.0.63-patched.20260825.1"
+        versionCode = 2026082502
+        versionName = "1.0.63-patched.20260825.2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
