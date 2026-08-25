@@ -26,6 +26,7 @@ android {
             storePassword = keystoreProperties["storePassword"] as String
             keyAlias = keystoreProperties["keyAlias"] as String
             keyPassword = keystoreProperties["keyPassword"] as String
+            storeType = "PKCS12"
             // 启用 V1+V2 签名：V1 签名兼容旧安装器，V2 签名提供更好的安全性
             // version-control-info 已被禁用，不会污染 V1 签名链
             enableV1Signing = true
@@ -38,8 +39,10 @@ android {
         applicationId = "com.ai.assistance.quro"
         minSdk = 26
         targetSdk = 34
-        versionCode = 501
-        versionName = "1.0.63"
+        // Stable patched builds use a monotonic date-based code so Android/Huawei
+        // treats every tested APK as an upgrade over official and earlier patches.
+        versionCode = 2026082503
+        versionName = "1.0.63-patched.20260825.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true

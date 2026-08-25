@@ -156,8 +156,8 @@ class QuroToolRegistry {
             "mcp_servers", "mcp_list_tools", "mcp_call", "mcp_deploy", "mcp_undeploy", "mcp_list_local",
             // MCP-ACI 桥接：通过 ACI 调用外部 MCP 服务器工具
             "mcp_aci_list", "mcp_aci_call", "mcp_aci_bridge",
-            // ZorvBrowser-ACI 桥接：通过 ACI 调用 ZorvBrowser 浏览器的工具
-            "browser_aci_list", "browser_aci_call", "browser_aci_bridge",
+            // ZorvBrowser 的能力仍可经通用 aci_list/aci_call 使用；三个专用桥接工具
+            // 保留在完整注册表，但不占用 OpenAI 默认核心集的 128 个名额。
             // 第三方服务授权保险库
             "auth_service_add", "auth_service_list", "auth_service_remove",
             // CMS v2 能力模块 + 特权通道自查

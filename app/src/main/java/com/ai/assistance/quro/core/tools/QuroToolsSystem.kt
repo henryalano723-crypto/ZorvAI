@@ -344,7 +344,9 @@ class StopAppTool : QuroTool {
             return "❌ 拒绝停止关键系统服务：${target.label}"
         }
 
-        val userId = android.os.Process.myUserHandle().identifier
+        // Android assigns app UIDs as userId * 100000 + appId. Public SDK 34 does not
+        // expose UserHandle#getIdentifier to Kotlin, so derive the current user safely.
+        val userId = android.os.Process.myUid() / 100000
         val result = QuroShizuku.exec("am force-stop --user $userId ${target.packageName}")
         return if (result.contains("exit=0")) {
             "✅ 已关闭 ${target.label}（${target.packageName}）"
