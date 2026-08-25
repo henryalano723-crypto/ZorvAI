@@ -36,6 +36,7 @@ object QuroToolUsageHints {
         "launch_app" to "「打开微信」「启动相机」「帮我开 XX 应用」都调用",
         "search_and_launch_app" to "「打开那个绿的聊天软件」「找一下能扫码的 App 打开」「名字里有'shop'的打开」都调用",
         "get_package_name" to "「XX 应用的包名是什么」「这个 App 的 package」都调用",
+        "stop_app" to "「关闭千问」「停止微信」「结束某应用」直接调用；传应用显示名即可自动查包名并通过 Shizuku 强制停止",
         "list_app_functions" to "「这个 App 能做什么」「XX 有哪些可调用功能」「能调起它的什么页面」都调用",
         "invoke_app_function" to "「用 XX App 分享到朋友圈」「调起 XX 的扫一扫」「让 XX 打开某页面」都调用",
 
