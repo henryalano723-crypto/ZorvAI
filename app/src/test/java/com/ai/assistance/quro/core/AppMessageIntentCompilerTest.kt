@@ -44,6 +44,23 @@ class AppMessageIntentCompilerTest {
     }
 
     @Test
+    fun compilesNaturalSearchThenSendVoiceCommand() {
+        assertEquals(
+            AppMessageIntentCompiler.Intent("微信", "灵儿", "你好", confirmSend = true),
+            AppMessageIntentCompiler.parse("打开微信搜索灵儿发送你好"),
+        )
+        assertEquals(
+            AppMessageIntentCompiler.Intent("微信", "灵儿", "你好", confirmSend = true),
+            AppMessageIntentCompiler.parse("在微信里搜灵儿然后发你好"),
+        )
+    }
+
+    @Test
+    fun recognizesFlexibleNaturalSendWordingForTheMessageToolGate() {
+        assertEquals(true, AppMessageIntentCompiler.hasExplicitSend("打开微信跟灵儿说你好"))
+    }
+
+    @Test
     fun pureSearchOrDraftDoesNotAuthorizeSending() {
         assertNull(AppMessageIntentCompiler.parse("打开微信搜索文件传输助手"))
         assertNull(AppMessageIntentCompiler.parse("打开微信搜索文件传输助手然后输入测试内容"))

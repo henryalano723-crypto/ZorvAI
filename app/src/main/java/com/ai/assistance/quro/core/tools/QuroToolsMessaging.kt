@@ -499,10 +499,18 @@ class SendMessageInAppTool : QuroTool {
         return when (transaction.stage) {
             VisualStage.SELECT_CONTACT -> {
                 val point = requiredVisualPoint(args, transaction) ?: return "❌ [选择联系人] 缺少唯一目标的有效中心坐标"
+                val beforeConversation = captureAppSurfaceFingerprint(svc)
+                    ?: return "❌ [选择联系人] 点击前无法建立目标页面验证基线，禁止继续"
                 if (!dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())) {
                     return "❌ [选择联系人] 点击动作未能派发"
                 }
-                Thread.sleep(700)
+                if (!waitForStableAppSurfaceChange(svc, beforeConversation)) {
+                    return captureVisualStage(
+                        context,
+                        transaction,
+                        "上一次联系人点击后目标页面没有稳定变化，尚未进入会话；必须重新核对并选择联系人，禁止定位消息输入框。",
+                    )
+                }
                 transaction.stage = VisualStage.VERIFY_CONVERSATION
                 captureVisualStage(context, transaction)
             }
@@ -540,8 +548,12 @@ class SendMessageInAppTool : QuroTool {
         }
     }
 
-    private fun captureVisualStage(context: Context, transaction: VisualTransaction): String {
-        val question = when (transaction.stage) {
+    private fun captureVisualStage(
+        context: Context,
+        transaction: VisualTransaction,
+        retryNotice: String? = null,
+    ): String {
+        val stageQuestion = when (transaction.stage) {
             VisualStage.SELECT_CONTACT ->
                 "当前联系人结果列表中，精确定位名称为“${transaction.contact}”的唯一可点击结果"
             VisualStage.VERIFY_CONVERSATION ->
@@ -551,6 +563,7 @@ class SendMessageInAppTool : QuroTool {
             VisualStage.VERIFY_SENT ->
                 "核对发送后输入框已经清空，并且当前会话中出现与用户原始正文逐字一致的新消息"
         }
+        val question = listOfNotNull(retryNotice, stageQuestion).joinToString(" ")
         val captured = VisualAnalysisTool().run(
             context,
             JSONObject().put("question", question).toString(),
@@ -577,9 +590,27 @@ class SendMessageInAppTool : QuroTool {
             put("message_body_retained_in_tool_arguments", true)
             put(
                 "instruction",
-                visualStageInstruction(transaction),
+                listOfNotNull(retryNotice, visualStageInstruction(transaction)).joinToString(" "),
             )
         }.toString()
+    }
+
+    private fun waitForStableAppSurfaceChange(
+        svc: com.ai.assistance.quro.service.QuroAccessibilityService,
+        before: IntArray,
+    ): Boolean {
+        var consecutiveChangedFrames = 0
+        repeat(10) {
+            Thread.sleep(250)
+            val after = captureAppSurfaceFingerprint(svc)
+            if (after != null && visualFingerprintsDiffer(before, after)) {
+                consecutiveChangedFrames += 1
+                if (consecutiveChangedFrames >= 2) return true
+            } else {
+                consecutiveChangedFrames = 0
+            }
+        }
+        return false
     }
 
     private fun visualStageInstruction(transaction: VisualTransaction): String = when (transaction.stage) {

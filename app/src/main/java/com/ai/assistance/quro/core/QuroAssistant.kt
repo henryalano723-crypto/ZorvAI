@@ -249,7 +249,10 @@ class QuroAssistant(
                 ?.let(AppSearchIntentCompiler::parse)
             var appSearchTransactionDispatched = false
             var messageTransactionDispatched = false
-            var messageWorkflowPending = false
+            // A recognized send request is not complete until it has entered the
+            // evidence-gated send_message_in_app transaction.  This also covers
+            // flexible wording whose structured arguments are extracted by the model.
+            var messageWorkflowPending = messageSendIntent
             var activeVisualMessageTransaction = false
             var messageSearchResultsReady = false
             while (round < roundLimit) {
@@ -272,6 +275,14 @@ class QuroAssistant(
                     else -> historyRounds
                 }
                 val requestSpecs = if (activeVisualMessageTransaction) {
+                    effectiveSpecs.filter { it.name == "send_message_in_app" }
+                } else if (messageSendIntent && !messageTransactionDispatched) {
+                    // A natural-language send request must enter the evidence-gated message
+                    // transaction before the model can touch any focused editor.  Exposing
+                    // input_text/search_in_app here lets a model search the contact correctly,
+                    // then overwrite that still-focused search field with the message body.
+                    // Keep intent extraction flexible by letting the cloud model fill the
+                    // structured tool arguments, but make the first executable path unique.
                     effectiveSpecs.filter { it.name == "send_message_in_app" }
                 } else if (activeToolRouter != null) {
                     activeToolRouter.activeSpecs()

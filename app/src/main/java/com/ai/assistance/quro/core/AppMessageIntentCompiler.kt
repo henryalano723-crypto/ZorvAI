@@ -20,7 +20,7 @@ internal object AppMessageIntentCompiler {
     )
 
     private val explicitSend = Regex(
-        "(?:发送(?:消息|信息)?|发出|发消息|发信息|发给|给.{1,40}?发|点击发送|按发送|回复|转发|send\\s+(?:a\\s+)?message)",
+        "(?:发送(?:消息|信息)?|发出|发消息|发信息|发给|给.{1,40}?发|(?:打开|去|在|用).{1,30}?(?:跟|对).{1,40}?说|点击发送|按发送|回复|转发|send\\s+(?:a\\s+)?message)",
         RegexOption.IGNORE_CASE,
     )
     private val searchWord = Regex("(?:搜索|搜|查找)")
@@ -32,6 +32,10 @@ internal object AppMessageIntentCompiler {
         "^\\s*(?:打开|去|在|用)?\\s*(.{1,30}?)(?:里|中|内)?\\s*给\\s*(.{1,40}?)\\s*" +
             "(?:发送(?:消息|信息)?|发消息|发信息|发|说)\\s*[：:]?\\s*(.+?)\\s*[。.!！]?$",
     )
+    private val searchThenSend = Regex(
+        "^\\s*(?:打开|去|在|用)?\\s*(.{1,30}?)(?:里|中|内)?\\s*(?:搜索|搜|查找)\\s*(.{1,40}?)\\s*" +
+            "(?:然后|并|再)?\\s*(?:发送(?:消息|信息)?|发消息|发信息|发|说)\\s*[：:]?\\s*(.+?)\\s*[。.!！]?$",
+    )
 
     fun hasExplicitSend(userText: String): Boolean = explicitSend.containsMatchIn(userText)
 
@@ -39,6 +43,14 @@ internal object AppMessageIntentCompiler {
         val text = userText.trim()
         if (!hasExplicitSend(text)) return null
         directSend.matchEntire(text)?.let { match ->
+            val app = match.groupValues[1].trim().trimEnd('里', '中', '内').trim()
+            val contact = match.groupValues[2].trim().trim('，', ',', '。', '.', '！', '!', '“', '”', '"', '\'')
+            val message = match.groupValues[3].trim().trim('，', ',', '。', '.', '！', '!', '“', '”', '"', '\'')
+            if (app.isNotEmpty() && contact.isNotEmpty() && message.isNotEmpty()) {
+                return Intent(app, contact, message, confirmSend = true)
+            }
+        }
+        searchThenSend.matchEntire(text)?.let { match ->
             val app = match.groupValues[1].trim().trimEnd('里', '中', '内').trim()
             val contact = match.groupValues[2].trim().trim('，', ',', '。', '.', '！', '!', '“', '”', '"', '\'')
             val message = match.groupValues[3].trim().trim('，', ',', '。', '.', '！', '!', '“', '”', '"', '\'')
