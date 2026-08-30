@@ -39,9 +39,9 @@ class QuroAidlAciCallTool : QuroTool {
     override val name = "aci_call"
     override val description =
         "调用一个第三方 App 通过 ACI（Agent Capability Interface）暴露的能力（如发消息 / 查未读 / 建群 / 打开网页 / 执行网页 JS / 发起 HTTP 请求 / 共享工作空间读写 workspace_write·workspace_read·workspace_list·workspace_delete）。" +
-            "参数：{\"target_package\":\"第三方 App 包名（用 aci_list 查到的 pkg，可选，若留空则自动使用用户在 ACI 管理中心设置的默认应用）\",\"capability\":\"能力 id（如 send_message / browser_open / http_request）\",\"args\":{参数名:参数值}}。" +
+            "参数：{\"target_package\":\"第三方 App 包名（由任务路由或 aci_list 确认，必填）\",\"capability\":\"能力 id（如 send_message / browser_open / http_request）\",\"args\":{参数名:参数值}}。" +
             "调用会跨进程发往目标 App 的 ACI Service 并同步等待结果（最长约 15 秒）。" +
-            "【重要】target_package 是可选参数！如果用户已经在 ACI 管理中心设置了默认应用，你可以省略 target_package，系统会自动使用默认应用。" +
+            "【重要】target_package 必须显式提供；默认 ACI 只供任务路由器选候选，不能在执行阶段静默回退。" +
             "调用前请勿伪造包名——目标 App 会用 Binder 真实 UID 鉴权。" +
             "若目标能力 requireUserConfirm（aci_list 会标注「需要用户确认」），必须先征询用户明确同意，并在 args 中带 confirm:true 才允许调用。" +
             "若返回 503（服务未绑定），属绑定生命周期问题，框架会自动重绑——直接重试一次即可，禁止用 Shizuku/dumpsys/ROOT 去\"修复\"。其他错误码原样转告用户，不要臆测为权限不足。" +
@@ -57,12 +57,12 @@ class QuroAidlAciCallTool : QuroTool {
     override val parametersJson = """{
         "type":"object",
         "properties":{
-            "target_package":{"type":"string","description":"第三方 App 包名，例如 com.example.chat（用 aci_list 查到）。若留空则自动使用用户在 ACI 管理中心设置的默认应用。"},
+            "target_package":{"type":"string","description":"第三方 App 包名，例如 com.example.chat。必须显式提供，禁止因省略而误调用默认浏览器。"},
             "capability":{"type":"string","description":"能力 id，例如 send_message / get_unread_count / create_group"},
             "args":{"type":"object","description":"能力所需参数，键为参数名，值为字符串/数字/布尔，例如 {\"contact\":\"张三\",\"content\":\"你好\"}"},
             "confirm":{"type":"boolean","description":"（可选）仅当目标能力 requireUserConfirm 时需要：先征得用户同意再设 true。它是控制方令牌，不会作为业务参数传入远端。"}
         },
-        "required":["capability"]
+        "required":["target_package","capability"]
     }"""
 
     override fun run(context: Context, arguments: String): String {
@@ -71,19 +71,10 @@ class QuroAidlAciCallTool : QuroTool {
 
         val obj = runCatching { JSONObject(arguments) }
             .getOrElse { return "参数不是合法 JSON：$arguments" }
-        var target = obj.optString("target_package", "").trim()
+        val target = obj.optString("target_package", "").trim()
         val cap = obj.optString("capability", "").trim()
         
-        // 如果 target_package 为空，使用默认 ACI 应用
-        if (target.isEmpty()) {
-            val defaultPackage = AciAppPreferences.getDefaultPackage(context)
-            if (defaultPackage != null) {
-                target = defaultPackage
-            } else {
-                return "缺少 target_package（要调用的第三方 App 包名，用 aci_list 查）。" +
-                    "或者先在 ACI 管理中心设置默认应用。"
-            }
-        }
+        if (target.isEmpty()) return "缺少 target_package。为防止普通原生 App 任务被默认浏览器 ACI 劫持，必须显式指定已发现的 ACI 包名。"
         if (cap.isEmpty()) return "缺少 capability（能力 id，用 aci_list 查）。"
 
         val argsObj = obj.optJSONObject("args")
@@ -136,12 +127,16 @@ class QuroAidlAciCallTool : QuroTool {
                 sb.append("URL: $url\n")
                 sb.append("标题: $title\n")
                 if (fullHtml != null) {
-                    sb.append("HTML（完整内容，经 gzip 解压，共 ${fullHtml.length} 字符）:\n")
-                    sb.append(fullHtml)
+                    val boundedHtml = fullHtml.take(12_000)
+                    sb.append("HTML（经 gzip 解压，共 ${fullHtml.length} 字符；返回模型最多 12000 字符）:\n")
+                    sb.append(boundedHtml)
+                    if (boundedHtml.length < fullHtml.length) sb.append("\n…[为控制 Token/TPM 已截断]")
                 } else {
                     if (truncated) sb.append("⚠️ 仅返回截断预览（Binder 限制，完整内容未传输）。\n")
-                    sb.append("HTML（共 ${htmlPreview.length} 字符）:\n")
-                    sb.append(htmlPreview)
+                    val boundedPreview = htmlPreview.take(12_000)
+                    sb.append("HTML（共 ${htmlPreview.length} 字符；返回模型最多 12000 字符）:\n")
+                    sb.append(boundedPreview)
+                    if (boundedPreview.length < htmlPreview.length) sb.append("\n…[为控制 Token/TPM 已截断]")
                 }
             // 输出其余未在上面专门处理的键（html_gz 不打印原始字节数组）
             val handled = setOf("url", "title", "html", "html_gz", "truncated")

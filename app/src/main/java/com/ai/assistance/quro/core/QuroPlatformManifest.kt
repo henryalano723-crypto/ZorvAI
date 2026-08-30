@@ -52,7 +52,8 @@ object QuroPlatformManifest {
   - 「下拉通知栏 / 看通知」= `global_action` 的 `notifications`（展开通知栏）或 `quick_settings`（下拉状态栏快捷开关）；要进一步点开下拉里的某个开关/通知，先 `read_screen` 找到它的文本，再 `tap_screen` 按文本点。
   - 「点开/关闭某个 App 里的开关、勾选某一项」= `read_screen` 找到开关文本 → `tap_screen` 按文本精确点（会自动点中该开关的父容器中心，不跑偏）。
   - 「长按某条消息选择/转发、长按应用图标弹菜单」= `long_press_screen` 按文本长按 → 在弹出的菜单里 `read_screen` 找菜单项 → `tap_screen` 点对应项。
-  - 「在搜索框打字再搜索」= `input_text`（按 hint 定位输入框填入）→ `tap_screen` 点「搜索」/ 用 `ai_keyboard_send`。
+  - 「去某 App 搜索/找某内容」且用户没有要求后续操作 = `search_in_app(app_name, query)`。搜索结果只是“发送/回复/转发”任务的中间步骤，绝不能当作整个任务完成。
+  - 「在聊天 App 找联系人并发送文字」= 优先 `send_message_in_app`；必须继续到唯一联系人、会话标题和正文都验证。只有 `MESSAGE_SEND_CONFIRMED` 才可报告已发送。
   - 「返回上一级 / 回桌面 / 看最近任务」= `global_action` 的 `back` / `home` / `recents`。
   - 定位不到时：**优先用文本/描述定位**（tap_screen 的 `text` / `description` 参数），其次才用 `read_screen` 给的 x,y 坐标；点击后如不确定是否生效，再 `read_screen` 一次看状态变化。把「读界面 → 定位元素 → 精细操作 → 回读确认」串成闭环，不要只说「我去帮你打开 App」。
 

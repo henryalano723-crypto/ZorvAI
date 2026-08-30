@@ -30,6 +30,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import java.io.File
+
+internal const val VISUAL_MESSAGE_HISTORY_ROUNDS = 2
 
 /**
  * Quro 助手编排核心：对话 + 工具调用的 ReAct 式循环。
@@ -181,6 +184,13 @@ class QuroAssistant(
             // 🔧 #765 防御：记录流式累计文本，终态 result.content 异常空白时回退到此，避免正文被截断覆盖。
             var streamedContent: String = ""
             val emit = { onUpdate?.invoke() }
+            // p40.8 之前自动截图会永久留在隐藏历史中；长工具链因此把多张 base64 图片
+            // 每轮重复发给模型，单次请求可膨胀到 10 万 token。新任务开始时先清掉旧遗留，
+            // 不触碰用户上传图片，也不删除任何可见对话。
+            store.discardAutoVisualFallbacks().takeIf { it > 0 }?.let { removed ->
+                Log.i("QuroAssistant", "AUTO_VISUAL_PURGE stale=$removed")
+                emit()
+            }
             QuroAgentTrace.status("assistant", "AI 开始响应")
             // 自动触发流体云通知：AI 开始处理时创建胶囊
             showFluidCloudSafe(context, "ZorvAI", "处理中...", 0)
@@ -228,6 +238,20 @@ class QuroAssistant(
             var prevCallSig: String? = null   // 上一轮工具调用签名，用于死循环检测
             var repeatStreak = 0
             var warnedForSig: String? = null  // 同一失败签名只提示一次，避免每条重复失败都再灌一条 [系统提示]
+            val currentUserRequest = store.all().lastOrNull { it.role == "user" && !it.hidden }?.content.orEmpty()
+            // A search is only terminal for a pure search request. If the user explicitly asks to
+            // send/reply/forward a message, search is merely a child step and must never consume
+            // the whole task. This guard is deliberately semantic and precedes the search compiler.
+            val compiledMessageIntent = AppMessageIntentCompiler.parse(currentUserRequest)
+            val messageSendIntent = AppMessageIntentCompiler.hasExplicitSend(currentUserRequest)
+            val appSearchIntent = currentUserRequest
+                .takeUnless { messageSendIntent }
+                ?.let(AppSearchIntentCompiler::parse)
+            var appSearchTransactionDispatched = false
+            var messageTransactionDispatched = false
+            var messageWorkflowPending = false
+            var activeVisualMessageTransaction = false
+            var messageSearchResultsReady = false
             while (round < roundLimit) {
                 // 协作取消点：用户点击「停止生成」取消父 Job 后，下一轮循环立即抛 CancellationException，
                 // 避免生成协程在「思考中」卡死无法中断（配合下方 client.chat 的取消透传）。
@@ -242,8 +266,50 @@ class QuroAssistant(
                 // 这里对本地路径强制一个合理轮数上限（用户未显式设置 historyRounds 时生效），让模型始终只在
                 // 「最近 N 轮」的干净上下文里作答，从源头消除无界历史导致的乱恢复。云端模型上下文窗口大、能力强，
                 // 不受影响。8 轮对 1.2B~3B 模型足够覆盖正常多轮，同时把历史长度压在模型有效注意力范围内。
-                val effHistoryRounds = if (isLocal && historyRounds <= 0) 8 else historyRounds
-                val llmMessages = runCatching { store.toLlmMessages(system, cfg.contextWindow, effHistoryRounds) }.getOrElse { emptyList() }
+                val effHistoryRounds = when {
+                    activeVisualMessageTransaction -> VISUAL_MESSAGE_HISTORY_ROUNDS
+                    isLocal && historyRounds <= 0 -> 8
+                    else -> historyRounds
+                }
+                val requestSpecs = if (activeVisualMessageTransaction) {
+                    effectiveSpecs.filter { it.name == "send_message_in_app" }
+                } else if (activeToolRouter != null) {
+                    activeToolRouter.activeSpecs()
+                } else {
+                    effectiveSpecs
+                }
+                // contextWindow 必须覆盖整个输入，而不只是 message.content。旧实现漏掉 tools Schema 与
+                // 每条消息的 JSON/ID 开销，设置 32K 时真机实际发出 42.8K。云端先预留本轮真实工具定义
+                // 和少量 envelope，再用剩余额度裁历史；本地模型保持原 n_ctx 语义。
+                val messageContextWindow = if (isLocal) {
+                    cfg.contextWindow
+                } else {
+                    val totalWindow = if (cfg.contextWindow > 0) {
+                        cfg.contextWindow.coerceAtMost(MODEL_MAX_INPUT_TOKENS)
+                    } else {
+                        MODEL_MAX_INPUT_TOKENS
+                    }
+                    (totalWindow - estimateToolSpecsTokens(requestSpecs) - 512).coerceAtLeast(4_096)
+                }
+                val llmMessages = runCatching {
+                    val requestSystem = if (activeVisualMessageTransaction) {
+                        QuroMessage(
+                            role = "system",
+                            content = "你正在续接一个已启动的消息发送视觉事务。只读取最近一次结构化工具结果和附图，" +
+                                "严格按其中 transaction_id、stage、instruction 调用 send_message_in_app。" +
+                                "不得调用其他工具，不得输出解释；不确定时 visual_verified=false。",
+                            hidden = true,
+                        )
+                    } else {
+                        system
+                    }
+                    store.toLlmMessages(requestSystem, messageContextWindow, effHistoryRounds)
+                }.getOrElse { emptyList() }
+                // 自动截图只允许进入紧接着的一次 llmMessages 快照。快照建立后立刻从 store
+                // 移除，后续轮次不再携带；本次 HTTP 重试仍复用当前快照，不影响可靠性。
+                store.discardAutoVisualFallbacks().takeIf { it > 0 }?.let { consumed ->
+                    Log.i("QuroAssistant", "AUTO_VISUAL_CONSUMED count=$consumed round=$round")
+                }
                 // 流式增量回调（云端 / 本地离线模型**共用**）。参数 acc 为「累计文本」。
                 // ⚠️ #1112 修复：此前本地（MNN / llama.cpp）路径压根不传 onToken，且下方 streaming
                 //   还对本地强制置 false —— 本地推理整条链零流式。手机 CPU 上一次生成动辄数十秒到
@@ -362,7 +428,7 @@ class QuroAssistant(
                             messages = llmMessages,
                             temperature = effTemperature,
                             maxTokens = effMaxTokens,
-                            tools = if (activeToolRouter != null) activeToolRouter.activeSpecs() else effectiveSpecs,
+                            tools = requestSpecs,
                             stream = streaming,
                             // 注意：v384 已根除重组期重编译正则的 ANR 真凶，此处无需再用 500ms 粗节流保命。
                             onToken = if (streaming) emitStreamToken else null,
@@ -405,6 +471,30 @@ class QuroAssistant(
 
                 when (result) {
                     is QuroLlmResult.Text -> {
+                        // A visual message transaction is controlled by explicit tool terminal
+                        // markers. A prose answer in the middle cannot silently abandon it.
+                        if (messageWorkflowPending) {
+                            streamPlaceholderId?.let { store.remove(it) }
+                            streamPlaceholderId = null
+                            streamedContent = ""
+                            store.add(
+                                QuroMessage(
+                                    role = "system",
+                                    content = if (activeVisualMessageTransaction) {
+                                        "[消息事务尚未结束] 不得用文字结束。读取最近一次 message_send 结构化结果，" +
+                                            "严格按其中 transaction_id、stage 和 instruction 再次调用 send_message_in_app。" +
+                                            "只有 MESSAGE_DRAFT_VERIFIED、MESSAGE_SEND_CONFIRMED 或明确错误终止才能返回文字。"
+                                    } else {
+                                        "[发送任务尚未进入消息事务] search_in_app 只完成了搜索子步骤，不得用文字结束。" +
+                                            "请从原始用户指令提取应用、精确联系人和完整正文，立即调用 send_message_in_app；" +
+                                            "只有缺少必要参数时才向用户澄清。"
+                                    },
+                                    hidden = true,
+                                ),
+                            )
+                            emit()
+                            continue
+                        }
                         // 🛡️ 内容提取：只取模型返回的正式 content；reasoning 绝不进 content。
                         //   此前 content=reasoning 导致「思考 HTML 同时出现在正文气泡和 ThinkBubble」。
                         //   reasoning 仅通过 reasoning 字段传递，由 ChatScreen 的 ThinkBubble 按需渲染。
@@ -463,8 +553,35 @@ class QuroAssistant(
                         // tool_calls 各 id 不可重复，tool 结果消息的 tool_call_id 须回指原 call）。
                         // 旧实现把整轮所有 call 都 copy 成同一个 callId → id 撞车、结果对不上，
                         // 导致模型一次性吐多个工具时整轮错乱，只能退化成「一轮一个」。
+                        val messageRewrittenCalls = AppMessageIntentCompiler.rewriteFirstStep(
+                            calls = result.calls,
+                            intent = compiledMessageIntent,
+                            alreadyDispatched = messageTransactionDispatched,
+                            searchResultsReady = messageSearchResultsReady,
+                        )
+                        if (messageRewrittenCalls.any { it.name == "send_message_in_app" }) {
+                            messageTransactionDispatched = true
+                        }
+                        val rewrittenCalls = AppSearchIntentCompiler.rewriteFirstStep(
+                            calls = messageRewrittenCalls,
+                            intent = appSearchIntent,
+                            alreadyDispatched = appSearchTransactionDispatched,
+                        )
+                        if (rewrittenCalls.any { it.name == "search_in_app" }) {
+                            appSearchTransactionDispatched = true
+                        }
+                        if (rewrittenCalls !== result.calls) {
+                            Log.i(
+                                "QuroAssistant",
+                                if (compiledMessageIntent != null) {
+                                    "APP_MESSAGE_COMPILED app=${compiledMessageIntent.appName} contactLength=${compiledMessageIntent.contact.length}"
+                                } else {
+                                    "APP_SEARCH_COMPILED app=${appSearchIntent?.appName} queryLength=${appSearchIntent?.query?.length}"
+                                },
+                            )
+                        }
                         val base = "call_${System.nanoTime()}_$round"
-                        val callsWithId = result.calls.mapIndexed { idx, c -> c.copy(id = "${base}_$idx") }
+                        val callsWithId = rewrittenCalls.mapIndexed { idx, c -> c.copy(id = "${base}_$idx") }
                         // 🔑 关键修复：MiMo 等模型在返回 tool_calls 的同时会附带 reasoning_content
                         // （本轮思考过程）。此前 ToolCalls 结果类型不携带 reasoning → 思考内容被直接丢弃，
                         // 模型下一轮在「失忆」状态下做决策，无法链式编排多步工具调用。
@@ -513,7 +630,7 @@ class QuroAssistant(
                         val t0 = System.currentTimeMillis()
                         // 🔧 渐进式工具披露：tool_router 调用由 router 处理（返回目录/加载工具），
                         // 不进 engine.execute（它不是真实可执行工具）。其余正常执行。
-                        val results = if (activeToolRouter != null && callsWithId.any { it.name == "tool_router" }) {
+                        val rawResults = if (activeToolRouter != null && callsWithId.any { it.name == "tool_router" }) {
                             val byId = LinkedHashMap<String, QuroToolResult>()
                             val normalCalls = ArrayList<QuroToolCall>()
                             callsWithId.forEach { c ->
@@ -532,6 +649,32 @@ class QuroAssistant(
                         } else {
                             runCatching { engine.execute(context, callsWithId) }
                                 .getOrElse { e -> callsWithId.map { QuroToolResult(it.name, "工具执行异常：${e.message}") } }
+                        }
+                        // 在结果进入消息、UI 和执行轨迹前统一限量；否则历史整理阶段再截断已经太晚，
+                        // 同一轮的原始控件树/网页正文仍会直接撑爆下一次模型请求。
+                        val results = compactImmediateToolResults(rawResults)
+                        callsWithId.zip(results).forEach { (call, toolResult) ->
+                            if (call.name == "search_in_app" && messageSendIntent) {
+                                messageWorkflowPending = true
+                                activeVisualMessageTransaction = false
+                                if (AppMessageIntentCompiler.isMatchingSearchResultsHandoff(
+                                        call = call,
+                                        result = toolResult.result,
+                                        intent = compiledMessageIntent,
+                                    )) {
+                                    messageSearchResultsReady = true
+                                    messageTransactionDispatched = false
+                                }
+                            }
+                            if (call.name == "send_message_in_app") {
+                                messageSearchResultsReady = false
+                                val structured = runCatching { JSONObject(toolResult.result) }.getOrNull()
+                                messageWorkflowPending = structured?.let {
+                                    it.optString("workflow") == "message_send" &&
+                                        it.optString("status") == "needs_visual"
+                                } ?: false
+                                activeVisualMessageTransaction = messageWorkflowPending
+                            }
                         }
                         val dur = System.currentTimeMillis() - t0
                         // 自动更新流体云进度：基于轮次计算进度（每轮+10%，上限90%）
@@ -559,6 +702,41 @@ class QuroAssistant(
                             )
                             emit()
                         }
+                        // 视觉工具返回 attach_to_next_model 标记时，把截图作为隐藏 user 图片消息附到
+                        // 下一轮请求。这样视觉模型真正看到像素，而不是收到无意义的路径或 base64 预览。
+                        callsWithId.zip(results).firstNotNullOfOrNull { (call, r) ->
+                            val json = runCatching { JSONObject(r.result) }.getOrNull() ?: return@firstNotNullOfOrNull null
+                            if (!json.optBoolean("attach_to_next_model", false)) return@firstNotNullOfOrNull null
+                            val path = json.optString("path", "")
+                            val file = File(path)
+                            if (!file.isFile) return@firstNotNullOfOrNull null
+                            val width = json.optInt("width", 0)
+                            val height = json.optInt("height", 0)
+                            val question = json.optString("question", "定位当前屏幕上的目标控件")
+                            val nodeSummary = json.optString("node_summary", "").take(500)
+                            QuroMessage(
+                                role = "user",
+                                content = "[自动视觉兜底，附图 ${width}x${height}，左上角对应原屏幕 (0,0)]\n$question\n" +
+                                    "无障碍摘要：${nodeSummary.ifBlank { "无有效节点" }}\n" +
+                                    json.optString(
+                                        "instruction",
+                                        "请根据当前问题只选择一个可验证的下一步动作；禁止猜测坐标，不要重复 read_screen 或截图。",
+                                    ),
+                                attachments = listOf(
+                                    QuroAttachment(
+                                        type = "image",
+                                        uri = file.absolutePath,
+                                        name = file.name,
+                                        mime = json.optString("mime", "image/png"),
+                                        size = file.length(),
+                                    ),
+                                ),
+                                hidden = true,
+                            )
+                        }?.let {
+                            store.add(it)
+                            emit()
+                        }
                         // AI 发文件：工具 attach_file 成功 → 作为可见 AI 气泡附件呈现（图片/视频/文档直接预览）
                         val aiAttPairs = callsWithId.zip(results).mapNotNull { (call, r) ->
                             if (call.name != "attach_file") return@mapNotNull null
@@ -581,6 +759,32 @@ class QuroAssistant(
                         // 轨迹：把工具执行结果写入总线
                         callsWithId.zip(results).forEach { (c, r) ->
                             QuroAgentTrace.result("tool", c.name, r.result)
+                        }
+                        // 高层搜索事务已完成并验证页面变化：这是明确终态，立即结束工具循环。
+                        // 不再让模型追加 input_text/tap_screen，避免已经搜索成功后继续操作。
+                        val completedSearch = results.firstOrNull {
+                            it.result.contains("[SEARCH_TRANSACTION_COMPLETE]")
+                        }
+                        if (completedSearch != null && appSearchIntent != null) {
+                            lastText = completedSearch.result.replace("[SEARCH_TRANSACTION_COMPLETE] ", "")
+                                .replace("[SEARCH_TRANSACTION_COMPLETE]", "")
+                                .trim()
+                            store.add(QuroMessage(role = "assistant", content = lastText))
+                            emit()
+                            finishFluidCloudSafe(context)
+                            return@withContext lastText
+                        }
+                        if (messageSendIntent && callsWithId.any { it.name == "search_in_app" }) {
+                            store.add(
+                                QuroMessage(
+                                    role = "system",
+                                    content = "[消息事务继续] 原始用户任务包含发送/回复动作。" +
+                                        "search_in_app 只完成了子步骤，不是任务终点。" +
+                                        "必须继续唯一选择联系人、核对会话、输入正文，并严格按用户授权决定是否发送。" +
+                                        "只有 MESSAGE_DRAFT_VERIFIED 或 MESSAGE_SEND_CONFIRMED 才是终态。",
+                                    hidden = true,
+                                ),
+                            )
                         }
                         // 🔁 工具调用重复 → 区分「成功重复」与「失败重试」（非代码强制中断）：
                         // 模型「连续请求完全相同的同一组工具调用」（name+arguments 一致）本身不等于出错——

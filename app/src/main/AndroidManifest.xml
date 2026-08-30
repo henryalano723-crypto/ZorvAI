@@ -76,6 +76,8 @@
     <!-- 包可见性：Android 11+ 默认隐藏其他 app；TTS 引擎是跨 app 的 TTS_SERVICE 远端服务，
          必须拥有足够包可见性才能绑定，确保 TextToSpeech 能发现并连接引擎。 -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+    <!-- Restore the exact external task stack after the user returns to Zorv to add an instruction. -->
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
     <!-- Google Play Install Referrer API：用于归因分析，追踪应用安装来源 -->
     <uses-permission android:name="com.google.android.finsky.permission.BIND_GET_INSTALL_REFERRER_SERVICE" />
 

@@ -9,7 +9,7 @@ import com.k2fsa.sherpa.ncnn.RecognizerConfig
 import java.io.File
 
 /**
- * 端侧 ASR（离线语音识别）模型配置系统 —— 基于 Sherpa-NCNN **流式 transducer**，全程本地不连云。
+ * 端侧 ASR（离线语音识别）模型配置系统 —— 同时支持 Sherpa-NCNN 与 Sherpa-ONNX，全程本地不连云。
  *
  * ## 为什么从 SenseVoice 换成流式 zipformer（用户问题 4 的真实修复）
  *
@@ -19,9 +19,8 @@ import java.io.File
  * 叠加 SenseVoice 的体积问题（下载 215.8MB / 落盘 222MB+ / 全量常驻内存），
  * 对手机而言是双重不可用。
  *
- * 现方案：用 .so 真实导出的流式 `SherpaNcnn` API，配 transducer 三件套模型
- * （encoder/decoder/joiner 的 .ncnn.param + .ncnn.bin），最小 22MB 下载，
- * 流式解码内存占用低，且原生层自带端点检测（说完自动停）。
+ * 现方案保留轻量 NCNN transducer，并加入官方 Sherpa-ONNX JNI：中文优先使用
+ * SenseVoiceSmall，连续听写可使用流式 Paraformer。三种引擎按部署记录和目录布局自动选择。
  */
 
 /** 错误页下限：任何 <1MB 的「模型目录」必为坏文件/HTML 错误页。 */
@@ -92,12 +91,20 @@ object AsrDeviceCompat {
 /**
  * 端侧 ASR 模型类型。
  *
- * 当前随包 .so 只实现了流式 transducer（`SherpaNcnn`），故只有一种可用类型。
- * [SENSE_VOICE_LEGACY] 仅用于**识别历史遗留部署**并提示用户迁移，不可加载。
+ * [SENSE_VOICE_LEGACY] 仅用于识别旧 NCNN SenseVoice 布局；它与新 ONNX SenseVoice 不同。
  */
 enum class AsrModelType(val label: String) {
-    /** 流式 transducer（encoder/decoder/joiner 三件套），当前唯一可运行类型。 */
+    /** 流式 transducer（encoder/decoder/joiner 三件套）。 */
     STREAMING_TRANSDUCER("流式 Transducer · 实时 · 离线"),
+
+    /** SenseVoiceSmall INT8：离线整句识别，通过短句 VAD 实现准实时体验。 */
+    ONNX_SENSE_VOICE("SenseVoiceSmall INT8 · 中文增强 · 离线"),
+
+    /** 阿里 Paraformer 中英双语流式模型。 */
+    ONNX_STREAMING_PARAFORMER("Paraformer 中英双语 · 流式 · 离线"),
+
+    /** Qwen3-ASR 0.6B：高准确率非流式整句识别。 */
+    ONNX_QWEN3_ASR("Qwen3-ASR 0.6B INT8 · 高准确率 · 离线"),
 
     /** 历史遗留的 SenseVoice 非流式部署——引擎不含对应符号，无法加载，仅用于提示迁移。 */
     SENSE_VOICE_LEGACY("SenseVoice（旧版·引擎不支持）"),
@@ -119,10 +126,30 @@ data class AsrModelFiles(
     val int8: Boolean,
 )
 
+/** Sherpa-ONNX 模型文件定位结果。未使用的字段保持空串。 */
+data class OnnxAsrFiles(
+    val type: AsrModelType,
+    val model: String = "",
+    val encoder: String = "",
+    val decoder: String = "",
+    val tokens: String = "",
+    val convFrontend: String = "",
+    val tokenizer: String = "",
+)
+
 /** 目录「布局」识别结果。 */
 enum class AsrModelLayout {
     /** 流式 transducer 三件套齐全，可加载。 */
     TRANSDUCER,
+
+    /** Sherpa-ONNX SenseVoice：单 model(.int8).onnx + tokens.txt。 */
+    ONNX_SENSE_VOICE,
+
+    /** Sherpa-ONNX 流式 Paraformer：encoder + decoder ONNX + tokens.txt。 */
+    ONNX_STREAMING_PARAFORMER,
+
+    /** Sherpa-ONNX Qwen3-ASR：conv frontend + encoder + decoder + tokenizer。 */
+    ONNX_QWEN3_ASR,
 
     /** 旧 SenseVoice NCNN 部署（model.ncnn.param 等），引擎无对应符号，不可加载。 */
     SENSE_VOICE_LEGACY,
@@ -152,6 +179,23 @@ fun detectAsrLayout(dir: File): AsrModelLayout {
         files.any { it.name.contains(role, true) && it.name.endsWith(".param", true) }
     }
     if (hasAllRoles) return AsrModelLayout.TRANSDUCER
+
+    val tokens = files.any { it.name.equals("tokens.txt", true) }
+    val onnxFiles = files.filter { it.name.endsWith(".onnx", true) }
+    if (onnxFiles.any { it.name.equals("conv_frontend.onnx", true) } &&
+        onnxFiles.any { it.name.contains("encoder", true) } &&
+        onnxFiles.any { it.name.contains("decoder", true) } &&
+        dir.walkTopDown().any { it.isDirectory && it.name.equals("tokenizer", true) }) {
+        return AsrModelLayout.ONNX_QWEN3_ASR
+    }
+    if (tokens && onnxFiles.any { it.name.contains("encoder", true) } &&
+        onnxFiles.any { it.name.contains("decoder", true) }) {
+        return AsrModelLayout.ONNX_STREAMING_PARAFORMER
+    }
+    if (tokens && onnxFiles.size == 1 &&
+        (dir.name.contains("sense", true) || onnxFiles.single().name.startsWith("model", true))) {
+        return AsrModelLayout.ONNX_SENSE_VOICE
+    }
 
     val hasOnnx = files.any { it.name.endsWith(".onnx", true) }
     if (hasOnnx) return AsrModelLayout.ONNX_LEGACY
@@ -215,6 +259,42 @@ fun findAsrFiles(dir: File, type: AsrModelType = AsrModelType.STREAMING_TRANSDUC
 private fun binOf(param: File): File =
     File(param.parentFile, param.name.removeSuffix(".param").removeSuffix(".PARAM") + ".bin")
 
+/** 定位 SenseVoice 或流式 Paraformer 的 ONNX 文件。 */
+fun findOnnxAsrFiles(dir: File, type: AsrModelType): OnnxAsrFiles? {
+    if (!dir.isDirectory) return null
+    val files = dir.walkTopDown().filter { it.isFile && it.length() > 0 }.take(4000).toList()
+    val tokens = files.firstOrNull { it.name.equals("tokens.txt", true) }
+    return when (type) {
+        AsrModelType.ONNX_SENSE_VOICE -> {
+            val tokenFile = tokens ?: return null
+            val model = files.firstOrNull { it.name.equals("model.int8.onnx", true) }
+                ?: files.firstOrNull { it.name.equals("model.onnx", true) }
+                ?: return null
+            OnnxAsrFiles(type, model = model.absolutePath, tokens = tokenFile.absolutePath)
+        }
+        AsrModelType.ONNX_STREAMING_PARAFORMER -> {
+            val tokenFile = tokens ?: return null
+            val encoder = files.filter { it.name.contains("encoder", true) && it.name.endsWith(".onnx", true) }
+                .sortedBy { if (it.name.contains("int8", true)) 0 else 1 }.firstOrNull() ?: return null
+            val decoder = files.filter { it.name.contains("decoder", true) && it.name.endsWith(".onnx", true) }
+                .sortedBy { if (it.name.contains("int8", true)) 0 else 1 }.firstOrNull() ?: return null
+            OnnxAsrFiles(type, encoder = encoder.absolutePath, decoder = decoder.absolutePath, tokens = tokenFile.absolutePath)
+        }
+        AsrModelType.ONNX_QWEN3_ASR -> {
+            val conv = files.firstOrNull { it.name.equals("conv_frontend.onnx", true) } ?: return null
+            val encoder = files.filter { it.name.contains("encoder", true) && it.name.endsWith(".onnx", true) }
+                .sortedBy { if (it.name.contains("int8", true)) 0 else 1 }.firstOrNull() ?: return null
+            val decoder = files.filter { it.name.contains("decoder", true) && it.name.endsWith(".onnx", true) }
+                .sortedBy { if (it.name.contains("int8", true)) 0 else 1 }.firstOrNull() ?: return null
+            val tokenizer = dir.walkTopDown().firstOrNull { it.isDirectory && it.name.equals("tokenizer", true) }
+                ?: return null
+            OnnxAsrFiles(type, encoder = encoder.absolutePath, decoder = decoder.absolutePath,
+                convFrontend = conv.absolutePath, tokenizer = tokenizer.absolutePath)
+        }
+        else -> null
+    }
+}
+
 /** 端侧 ASR 模型规格（内置预设 / 自定义链接通用）。 */
 data class AsrModelSpec(
     val id: String,
@@ -240,16 +320,56 @@ data class AsrModelSpec(
  * 内置模型目录 —— 全部为 Sherpa-NCNN **流式 transducer**，全部适配手机。
  *
  * 体积为官方 GitHub release asset 实测值（`api.github.com/.../releases/tags/models`）。
- * 排序即推荐优先级：默认首选中文 14M（22MB），这是对「原 215MB SenseVoice 不适合手机」的直接答复。
+ * 排序即推荐优先级：默认首选完整中英双语 Zipformer（准确率优先）；
+ * 22MB 中文 14M 保留为低延迟/低占用选项。
  */
 object AsrModelCatalog {
     private const val BASE = "https://github.com/k2-fsa/sherpa-ncnn/releases/download/models"
 
+    private const val ONNX_BASE =
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
+
     val BUILTIN: List<AsrModelSpec> = listOf(
         AsrModelSpec(
+            id = "sense-voice-int8-2025",
+            displayName = "SenseVoiceSmall INT8 · 中文增强 · 约230MB",
+            note = "阿里国产模型；普通话、中英混说、粤语与标点优先，完全离线。",
+            type = AsrModelType.ONNX_SENSE_VOICE,
+            downloadUrl = "$ONNX_BASE/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2",
+            downloadBytes = 240_000_000L,
+            numThreads = 3,
+        ),
+        AsrModelSpec(
+            id = "paraformer-streaming-zh-en",
+            displayName = "Paraformer 中英双语流式 INT8 · 部署约226MB（下载998MB）",
+            note = "阿里达摩院国产模型；边说边解码、延迟低，适合手机控制指令。",
+            type = AsrModelType.ONNX_STREAMING_PARAFORMER,
+            downloadUrl = "$ONNX_BASE/sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2",
+            downloadBytes = 1_046_773_000L,
+            numThreads = 3,
+        ),
+        AsrModelSpec(
+            id = "qwen3-asr-0.6b-int8-2026-03-25",
+            displayName = "Qwen3-ASR 0.6B INT8 · 部署约0.94GB · 准确率优先",
+            note = "高准确率整句识别；非流式、按需加载，适合口音、长句与复杂软件名称。",
+            type = AsrModelType.ONNX_QWEN3_ASR,
+            downloadUrl = "$ONNX_BASE/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
+            downloadBytes = 878_000_000L,
+            numThreads = 3,
+        ),
+        AsrModelSpec(
+            id = "zipformer-bilingual-zh-en-full",
+            displayName = "流式 Zipformer 中英双语完整版 · 124MB · 准确率优先",
+            note = "中文指令和中英混说首选；比 14M 小模型更占内存，但更适合应用名和完整句指令。",
+            type = AsrModelType.STREAMING_TRANSDUCER,
+            downloadUrl = "$BASE/sherpa-ncnn-streaming-zipformer-bilingual-zh-en-2023-02-13.tar.bz2",
+            downloadBytes = 129_578_378L,
+            numThreads = 3,
+        ),
+        AsrModelSpec(
             id = "zipformer-zh-14M",
-            displayName = "流式 Zipformer 中文 14M · 22MB · 推荐",
-            note = "手机首选：体积最小、延迟最低、内存占用最省。仅中文（英文词会识别不准）。",
+            displayName = "流式 Zipformer 中文 14M · 22MB · 低延迟",
+            note = "体积最小、延迟最低、内存占用最省；但准确率较低，不建议用于应用名或复杂指令。",
             type = AsrModelType.STREAMING_TRANSDUCER,
             downloadUrl = "$BASE/sherpa-ncnn-streaming-zipformer-zh-14M-2023-02-23.tar.bz2",
             downloadBytes = 23_247_105L,
@@ -293,7 +413,7 @@ object AsrModelCatalog {
         ),
     )
 
-    /** 默认推荐（手机最合适的一档）。 */
+    /** 默认推荐（中文准确率优先）。 */
     val RECOMMENDED: AsrModelSpec get() = BUILTIN.first()
 
     fun byId(id: String): AsrModelSpec? = BUILTIN.firstOrNull { it.id == id }

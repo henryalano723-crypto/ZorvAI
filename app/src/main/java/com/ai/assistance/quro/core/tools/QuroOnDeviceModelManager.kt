@@ -84,13 +84,22 @@ object QuroOnDeviceModelManager {
 
             onState("正在校验模型文件…")
             val layout = detectAsrLayout(destDir)
-            if (layout != AsrModelLayout.TRANSDUCER) {
+            val expectedLayout = when (spec.type) {
+                AsrModelType.STREAMING_TRANSDUCER -> AsrModelLayout.TRANSDUCER
+                AsrModelType.ONNX_SENSE_VOICE -> AsrModelLayout.ONNX_SENSE_VOICE
+                AsrModelType.ONNX_STREAMING_PARAFORMER -> AsrModelLayout.ONNX_STREAMING_PARAFORMER
+                AsrModelType.ONNX_QWEN3_ASR -> AsrModelLayout.ONNX_QWEN3_ASR
+                else -> AsrModelLayout.NONE
+            }
+            if (layout != expectedLayout) {
                 destDir.deleteRecursively()
                 fail(
                     appCtx, deployKey, onState,
                     when (layout) {
+                        AsrModelLayout.ONNX_SENSE_VOICE, AsrModelLayout.ONNX_STREAMING_PARAFORMER, AsrModelLayout.ONNX_QWEN3_ASR ->
+                            "压缩包内 ONNX 模型类型与所选引擎不一致"
                         AsrModelLayout.ONNX_LEGACY ->
-                            "压缩包内是 ONNX 模型，与本机 NCNN 引擎不兼容，请改用 Sherpa-NCNN 流式模型"
+                            "压缩包内是无法识别类型的 ONNX 模型"
                         AsrModelLayout.SENSE_VOICE_LEGACY ->
                             "压缩包内是旧版 SenseVoice 布局，缺少 encoder/decoder/joiner 三件套，引擎无法加载"
                         else ->
@@ -100,9 +109,16 @@ object QuroOnDeviceModelManager {
                 return@withContext false
             }
             // 三件套齐全但成对关系可能残缺（例如 .param 有而 .bin 缺），这里再做一次严格定位
-            if (findAsrFiles(destDir, AsrModelType.STREAMING_TRANSDUCER) == null) {
+            val filesValid = when (spec.type) {
+                AsrModelType.STREAMING_TRANSDUCER ->
+                    findAsrFiles(destDir, AsrModelType.STREAMING_TRANSDUCER) != null
+                AsrModelType.ONNX_SENSE_VOICE, AsrModelType.ONNX_STREAMING_PARAFORMER, AsrModelType.ONNX_QWEN3_ASR ->
+                    findOnnxAsrFiles(destDir, spec.type) != null
+                else -> false
+            }
+            if (!filesValid) {
                 destDir.deleteRecursively()
-                fail(appCtx, deployKey, onState, "模型文件不完整：encoder / decoder / joiner 的 .param 与 .bin 必须成对存在，且需要 tokens.txt")
+                fail(appCtx, deployKey, onState, "模型文件不完整或与所选识别引擎不匹配")
                 return@withContext false
             }
 
@@ -112,7 +128,7 @@ object QuroOnDeviceModelManager {
                 QuroOnDeviceModelPrefs.DeployedEntry(
                     destDir.absolutePath,
                     modelName,
-                    AsrModelType.STREAMING_TRANSDUCER.name,
+                    spec.type.name,
                     QuroOnDeviceModelPrefs.STATUS_DEPLOYED,
                 ),
             )
@@ -248,6 +264,7 @@ object QuroOnDeviceModelManager {
         return when (detectAsrLayout(File(dir))) {
             AsrModelLayout.TRANSDUCER -> findAsrFiles(File(dir), AsrModelType.STREAMING_TRANSDUCER)
             // 旧 ONNX / 旧 SenseVoice 部署与当前引擎不兼容，需重新下载流式模型
+            AsrModelLayout.ONNX_SENSE_VOICE, AsrModelLayout.ONNX_STREAMING_PARAFORMER, AsrModelLayout.ONNX_QWEN3_ASR,
             AsrModelLayout.ONNX_LEGACY -> null
             AsrModelLayout.SENSE_VOICE_LEGACY -> null
             AsrModelLayout.NONE -> null
@@ -262,6 +279,7 @@ object QuroOnDeviceModelManager {
         val dir = QuroOnDeviceModelPrefs.getDeployedDir(ctx.applicationContext) ?: return false
         return when (detectAsrLayout(File(dir))) {
             AsrModelLayout.SENSE_VOICE_LEGACY, AsrModelLayout.ONNX_LEGACY -> true
+            AsrModelLayout.ONNX_SENSE_VOICE, AsrModelLayout.ONNX_STREAMING_PARAFORMER, AsrModelLayout.ONNX_QWEN3_ASR -> false
             else -> false
         }
     }
@@ -296,7 +314,14 @@ object QuroOnDeviceModelManager {
         val d = dir?.let { File(it) } ?: return false
         if (!d.isDirectory) return false
         if (deployedDirMaxFileBytes(dir) < MIN_VALID_MODEL_BYTES) return false
-        if (detectAsrLayout(d) != AsrModelLayout.TRANSDUCER) return false
-        return findAsrFiles(d, AsrModelType.STREAMING_TRANSDUCER) != null
+        return when (detectAsrLayout(d)) {
+            AsrModelLayout.TRANSDUCER -> findAsrFiles(d, AsrModelType.STREAMING_TRANSDUCER) != null
+            AsrModelLayout.ONNX_SENSE_VOICE -> findOnnxAsrFiles(d, AsrModelType.ONNX_SENSE_VOICE) != null
+            AsrModelLayout.ONNX_STREAMING_PARAFORMER ->
+                findOnnxAsrFiles(d, AsrModelType.ONNX_STREAMING_PARAFORMER) != null
+            AsrModelLayout.ONNX_QWEN3_ASR ->
+                findOnnxAsrFiles(d, AsrModelType.ONNX_QWEN3_ASR) != null
+            else -> false
+        }
     }
 }

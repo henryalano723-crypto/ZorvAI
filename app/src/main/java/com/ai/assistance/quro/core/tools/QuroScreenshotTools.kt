@@ -1,5 +1,6 @@
 package com.ai.assistance.quro.core.tools
 
+import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
@@ -8,6 +9,7 @@ import android.os.Build
 import android.os.Environment
 import android.util.Base64
 import android.util.Log
+import android.view.Display
 import android.view.accessibility.AccessibilityNodeInfo
 import com.ai.assistance.quro.service.QuroAccessibilityService
 import java.io.ByteArrayOutputStream
@@ -17,7 +19,17 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+private val screenshotCaptureLock = ReentrantLock()
+private val screenshotCallbackExecutor = Executors.newSingleThreadExecutor { runnable ->
+    Thread(runnable, "QuroScreenshotCallback").apply { isDaemon = true }
+}
 
 /**
  * 屏幕截图工具集 - 实现视觉双模感知。
@@ -42,21 +54,29 @@ class ScreenshotTool : QuroTool {
 
         return try {
             // 方式1: Android P+ 原生截图
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val screenshot = captureWithAccessibility(svc)
                 if (screenshot != null) {
-                    val path = saveScreenshot(context, screenshot)
-                    return "✅ 截图成功: $path"
+                    try {
+                        val path = saveScreenshot(context, screenshot)
+                        return "✅ 截图成功: $path"
+                    } finally {
+                        screenshot.recycle()
+                    }
                 }
             }
 
             // 方式2: 像素级截图（通过View绘制）
-            val root = svc.rootInActiveWindow
+            val root = svc.actionableRoot()
             if (root != null) {
                 val bitmap = captureNodeTree(root)
                 if (bitmap != null) {
-                    val path = saveScreenshot(context, bitmap)
-                    return "✅ 截图成功: $path"
+                    try {
+                        val path = saveScreenshot(context, bitmap)
+                        return "✅ 截图成功: $path"
+                    } finally {
+                        bitmap.recycle()
+                    }
                 }
             }
 
@@ -69,45 +89,56 @@ class ScreenshotTool : QuroTool {
     /**
      * 通过 AccessibilityService.takeScreenshot() 截图（Android P+）。
      */
-    private fun captureWithAccessibility(service: QuroAccessibilityService): Bitmap? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+    internal fun captureWithAccessibility(service: QuroAccessibilityService): Bitmap? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        return screenshotCaptureLock.withLock {
+            val latch = CountDownLatch(1)
+            val accepting = AtomicBoolean(true)
+            val result = AtomicReference<Bitmap?>(null)
 
-        val latch = CountDownLatch(1)
-        var result: Bitmap? = null
+            try {
+                service.takeScreenshot(
+                    Display.DEFAULT_DISPLAY,
+                    screenshotCallbackExecutor,
+                    object : AccessibilityService.TakeScreenshotCallback {
+                        override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
+                            val converted = try {
+                                Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
+                                    ?.copy(Bitmap.Config.ARGB_8888, false)
+                            } catch (e: Throwable) {
+                                Log.w("ScreenshotTool", "takeScreenshot bitmap conversion failed", e)
+                                null
+                            } finally {
+                                screenshot.hardwareBuffer.close()
+                            }
+                            if (accepting.compareAndSet(true, false)) result.set(converted)
+                            else converted?.recycle() // callback arrived after timeout/cancellation
+                            latch.countDown()
+                        }
 
-        try {
-            // 使用反射调用 takeScreenshot（因为 SDK 限制）
-            val method = service.javaClass.getMethod(
-                "takeScreenshot",
-                Int::class.java,
-                android.os.Handler::class.java,
-                Any::class.java
-            )
-
-            val callback = object : Any() {
-                @android.annotation.SuppressLint("NewApi")
-                fun onScreenshot(bitmap: Bitmap?) {
-                    result = bitmap
-                    latch.countDown()
+                        override fun onFailure(errorCode: Int) {
+                            Log.w("ScreenshotTool", "takeScreenshot failed, code=$errorCode")
+                            accepting.set(false)
+                            latch.countDown()
+                        }
+                    },
+                )
+                val completed = latch.await(5, TimeUnit.SECONDS)
+                if (!completed) {
+                    accepting.set(false)
+                    result.getAndSet(null)?.recycle()
+                    Log.w("ScreenshotTool", "takeScreenshot timed out")
+                    null
+                } else {
+                    result.getAndSet(null)
                 }
+            } catch (e: Throwable) {
+                accepting.set(false)
+                result.getAndSet(null)?.recycle()
+                Log.w("ScreenshotTool", "takeScreenshot failed", e)
+                null
             }
-
-            // 主线程执行
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                try {
-                    method.invoke(service, 0, android.os.Handler(android.os.Looper.getMainLooper()), callback)
-                } catch (e: Exception) {
-                    Log.w("ScreenshotTool", "takeScreenshot reflection failed", e)
-                    latch.countDown()
-                }
-            }
-
-            latch.await(5, TimeUnit.SECONDS)
-        } catch (e: Exception) {
-            Log.w("ScreenshotTool", "takeScreenshot failed", e)
         }
-
-        return result
     }
 
     /**
@@ -226,7 +257,9 @@ class VisualAnalysisTool : QuroTool {
             return "❌ 无法截图: $result"
         }
 
-        val path = result.removePrefix("✅ 截图成功: ")
+        val originalPath = result.removePrefix("✅ 截图成功: ")
+        val searchFocused = question.contains("搜索") || question.contains("放大镜")
+        val path = if (searchFocused) createTopBandCrop(context, originalPath) ?: originalPath else originalPath
 
         // 2. 获取节点树作为辅助信息
         val nodeTreeInfo = try {
@@ -234,22 +267,37 @@ class VisualAnalysisTool : QuroTool {
             readTool.run(context, "{}").take(2000)
         } catch (e: Exception) { "" }
 
-        // 3. 构建多模态提示
-        return """
-## 📸 屏幕截图已保存
-路径: $path
-
-## 📋 节点树信息（辅助）
-$nodeTreeInfo
-
-## 🎯 用户问题
-$question
-
----
-**说明**: 截图已保存到本地。如需视觉模型分析，请使用 http_request 工具调用视觉API，
-传入截图路径和此提示词。或直接查看截图文件。
-        """.trimIndent()
+        // 3. 返回结构化标记；编排器会把这张图作为隐藏视觉用户消息附到下一轮模型请求。
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(path, bounds)
+        return org.json.JSONObject().apply {
+            put("status", "captured")
+            put("attach_to_next_model", true)
+            put("path", path)
+            put("mime", "image/png")
+            put("width", bounds.outWidth)
+            put("height", bounds.outHeight)
+            put("crop_left", 0)
+            put("crop_top", 0)
+            put("search_focused_crop", searchFocused && path != originalPath)
+            put("question", question.take(300))
+            put("node_summary", nodeTreeInfo.take(500))
+            put("instruction", "下一轮直接查看附带截图回答；截图坐标与原屏幕坐标一致。不要把屏幕顶部中心当作占位坐标，也不要重复 read_screen 或截图工具")
+        }.toString()
     }
+
+    /** 搜索入口通常位于页面顶部；裁掉无关长列表，让小型视觉模型保留图标细节。 */
+    private fun createTopBandCrop(context: Context, sourcePath: String): String? = runCatching {
+        val source = android.graphics.BitmapFactory.decodeFile(sourcePath) ?: return@runCatching null
+        val cropHeight = (source.height * 0.36f).toInt().coerceIn(360, source.height)
+        val cropped = Bitmap.createBitmap(source, 0, 0, source.width, cropHeight)
+        val dir = File(context.filesDir, "screenshots").apply { mkdirs() }
+        val output = File(dir, "${File(sourcePath).nameWithoutExtension}_top.png")
+        FileOutputStream(output).use { cropped.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        if (cropped !== source) cropped.recycle()
+        source.recycle()
+        output.absolutePath
+    }.getOrNull()
 }
 
 // ──────────────────── 系统级动作工具 ────────────────────

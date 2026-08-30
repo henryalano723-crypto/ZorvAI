@@ -47,6 +47,7 @@ import com.ai.assistance.quro.core.util.QuroServiceLifecycleOwner
 import com.ai.assistance.quro.core.tools.QuroSttHolder
 import com.ai.assistance.quro.core.QuroPlatformManifest
 import com.ai.assistance.quro.core.QuroConversationStore
+import com.ai.assistance.quro.core.aidlaci.AciTaskRouter
 import com.ai.assistance.quro.core.network.QuroLlmClient
 import com.ai.assistance.quro.core.model.QuroFunctionModelConfigRepository
 import com.ai.assistance.quro.core.model.QuroFunctionType
@@ -696,7 +697,7 @@ class QuroVoiceBallService : Service(), CoroutineScope by CoroutineScope(Dispatc
                             avatarUrl = uiPrefs.getString("user_avatar", "")?.takeIf { it.isNotBlank() },
                         )
                     )
-                    assistant.ask(applicationContext, cfg, buildVoiceSystemPrompt())
+                    assistant.ask(applicationContext, cfg, buildVoiceSystemPrompt(text))
                 }
                 mainHandler.post { speaking = true; status = "回复中：${reply.take(40)}" }
                 // 朗读协调：若本轮 AI 已通过 speak 工具主动控制播报（多音色/分段/唱歌等），
@@ -725,7 +726,7 @@ class QuroVoiceBallService : Service(), CoroutineScope by CoroutineScope(Dispatc
      * 语音球 system prompt（与 QuroChatViewModel.buildSystemPrompt 保持一致的人格认知）。
      * 确保语音球对话也拥有完整的人格身份 + 自我认知 + 工具调用能力。
      */
-    private fun buildVoiceSystemPrompt(): String {
+    private fun buildVoiceSystemPrompt(taskText: String): String {
         val persona = runCatching {
             val id = personaRepo.getActiveId()
             if (id.isBlank()) null else personaRepo.loadAll().firstOrNull { it.id == id }
@@ -777,7 +778,10 @@ class QuroVoiceBallService : Service(), CoroutineScope by CoroutineScope(Dispatc
         sb.append("\n## 可用工具（与 API tools 字段完全一致）\n")
         sb.append(com.ai.assistance.quro.core.tools.QuroToolUsageHints.buildToolUseDirective())
         sb.append("\n### 工具清单（格式：工具名：用途 [· 常见说法/多用途]）\n")
-        registry.coreSpecs().forEach { s ->
+        val aciRoute = AciTaskRouter.resolve(applicationContext, taskText)
+        // v1.16 统一渐进式路由：语音提示词只列常驻工具，冷门工具由 tool_router 按需披露。
+        val alwaysOn = com.ai.assistance.quro.core.tools.QuroToolRouter.ALWAYS_ON
+        AciTaskRouter.filterTools(registry.coreSpecs().filter { it.name in alwaysOn }, aciRoute).forEach { s ->
             sb.append("- ${s.name}：${s.description}\n")
             com.ai.assistance.quro.core.tools.QuroToolUsageHints.TOOL_USAGE_HINTS[s.name]?.let { hint ->
                 sb.append("    · 常见说法/多用途：$hint\n")

@@ -18,6 +18,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import androidx.core.app.NotificationCompat
 import com.ai.assistance.quro.activity.QuroMainActivity
 
@@ -53,8 +54,17 @@ class QuroAccessibilityService : AccessibilityService() {
                     context.contentResolver,
                     Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
                 ) ?: ""
-                val serviceName = "${context.packageName}/${QuroAccessibilityService::class.java.canonicalName}"
-                enabledServices.contains(serviceName)
+                val canonical = android.content.ComponentName(
+                    context,
+                    QuroAccessibilityService::class.java,
+                ).flattenToString()
+                enabledServices.split(':').any { raw ->
+                    val value = raw.trim()
+                    value == canonical ||
+                        value == "${context.packageName}/.service.QuroAccessibilityService" ||
+                        value.endsWith("/.service.QuroAccessibilityService") ||
+                        value.endsWith("/com.ai.assistance.quro.service.QuroAccessibilityService")
+                }
             } catch (e: Exception) {
                 false
             }
@@ -64,6 +74,24 @@ class QuroAccessibilityService : AccessibilityService() {
          * 检查服务实例是否存活
          */
         fun isServiceRunning(): Boolean = instance != null
+
+        internal fun actionableWindowScore(
+            type: Int,
+            focused: Boolean,
+            active: Boolean,
+            packageName: String,
+            selfPackage: String,
+        ): Int {
+            var score = 0
+            if (type == AccessibilityWindowInfo.TYPE_APPLICATION) score += 10_000
+            if (focused) score += 4_000
+            if (active) score += 2_000
+            if (packageName.isNotBlank() && packageName != selfPackage) score += 250
+            if (type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) score -= 20_000
+            if (type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) score -= 20_000
+            if (type == AccessibilityWindowInfo.TYPE_SYSTEM) score -= 5_000
+            return score
+        }
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -89,6 +117,34 @@ class QuroAccessibilityService : AccessibilityService() {
             lastEventTime = System.currentTimeMillis()
         }
         // 预留扩展点：界面自动化 / 屏幕读取。当前不收集数据。
+    }
+
+    /**
+     * 返回真正可操作的前台应用根节点。
+     *
+     * Zorv 的悬浮聊天窗口可能成为 rootInActiveWindow，即使淘宝/微信等目标 App
+     * 才是系统当前聚焦的应用。直接使用 rootInActiveWindow 会让 read_screen、点击和
+     * input_text 全部误操作 Zorv 自己。这里优先选择 focused/active 的 APPLICATION
+     * 窗口，并排除 IME、系统栏与无障碍悬浮层；无多窗口信息时才回退旧 API。
+     */
+    fun actionableRoot(): AccessibilityNodeInfo? {
+        val candidates = runCatching {
+            windows.mapNotNull { window ->
+                val root = window.root ?: return@mapNotNull null
+                val score = actionableWindowScore(
+                    type = window.type,
+                    focused = window.isFocused,
+                    active = window.isActive,
+                    packageName = root.packageName?.toString().orEmpty(),
+                    selfPackage = packageName,
+                )
+                Triple(score, window.layer, root)
+            }
+        }.getOrDefault(emptyList())
+        return candidates.maxWithOrNull(
+            compareBy<Triple<Int, Int, AccessibilityNodeInfo>> { it.first }
+                .thenBy { it.second },
+        )?.third ?: rootInActiveWindow
     }
 
     override fun onInterrupt() {
@@ -252,7 +308,7 @@ class QuroAccessibilityService : AccessibilityService() {
      * 注意：这是通用辅助能力，不针对任何特定 App，不自动发送、不含任何绕过风控逻辑。
      */
     fun performPaste(text: String): String {
-        val root = rootInActiveWindow ?: return "⚠️ 无法获取窗口根节点（APP 是否在前台？）"
+        val root = actionableRoot() ?: return "⚠️ 无法获取窗口根节点（APP 是否在前台？）"
         val target = findEditable(root) ?: return "❌ 未找到输入框：请先在目标 App 点一下要填的输入框"
         return try {
             val arg = Bundle().apply {

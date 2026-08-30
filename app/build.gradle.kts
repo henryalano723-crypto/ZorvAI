@@ -7,6 +7,10 @@ val keystoreProperties = Properties()
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(keystorePropertiesFile.inputStream())
 }
+val zorvStoreFile = keystoreProperties.getProperty("storeFile") ?: System.getenv("ZORV_STORE_FILE")
+val zorvStorePassword = keystoreProperties.getProperty("storePassword") ?: System.getenv("ZORV_STORE_PASSWORD")
+val zorvKeyAlias = keystoreProperties.getProperty("keyAlias") ?: System.getenv("ZORV_KEY_ALIAS")
+val zorvKeyPassword = keystoreProperties.getProperty("keyPassword") ?: System.getenv("ZORV_KEY_PASSWORD")
 
 plugins {
     alias(libs.plugins.android.application)
@@ -22,10 +26,10 @@ android {
     signingConfigs {
         // 使用 keystore.properties 中配置的签名证书
         create("release") {
-            storeFile = file(keystoreProperties["storeFile"] as String)
-            storePassword = keystoreProperties["storePassword"] as String
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["keyPassword"] as String
+            if (!zorvStoreFile.isNullOrBlank()) storeFile = file(zorvStoreFile)
+            storePassword = zorvStorePassword
+            keyAlias = zorvKeyAlias
+            keyPassword = zorvKeyPassword
             // 启用 V1+V2 签名：V1 签名兼容旧安装器，V2 签名提供更好的安全性
             // version-control-info 已被禁用，不会污染 V1 签名链
             enableV1Signing = true
@@ -38,8 +42,8 @@ android {
         applicationId = "com.ai.assistance.quro"
         minSdk = 26
         targetSdk = 34
-        versionCode = 505
-        versionName = "1.16"
+        versionCode = 2026082926
+        versionName = "1.16-p40.30"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true

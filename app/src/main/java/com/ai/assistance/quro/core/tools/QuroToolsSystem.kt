@@ -177,6 +177,7 @@ class LaunchAppTool : QuroTool {
             val intent = context.packageManager.getLaunchIntentForPackage(pkg)
                 ?: return "找不到可启动的入口：$pkg"
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ExternalUiTargetSession.remember(context, pkg)
             context.startActivity(intent)
             return "已启动 $pkg"
         }
@@ -186,6 +187,7 @@ class LaunchAppTool : QuroTool {
         val intent = context.packageManager.getLaunchIntentForPackage(target.packageName)
             ?: return "找到 ${target.label} 但无法启动"
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ExternalUiTargetSession.remember(context, target.packageName)
         context.startActivity(intent)
         return "已启动 ${target.label}（${target.packageName}）"
     }
@@ -194,7 +196,7 @@ class LaunchAppTool : QuroTool {
 /** 搜索并启动应用（一步完成：按名称查找 → 自动启动第一个匹配项，Shell 兜底）。 */
 class SearchAndLaunchAppTool : QuroTool {
     override val name = "search_and_launch_app"
-    override val description = "用户想要打开某个应用时的首选工具。输入应用名称（如「快手」「抖音」「微信」），自动搜索并启动最匹配的应用。比先 list_installed_apps 再 launch_app 更高效。"
+    override val description = "仅在已安装应用列表中按名称查找并打开 App。它不能搜索 App 内的联系人、商品或内容；凡是“在某 App 里搜索某内容”必须改用 search_in_app。"
     override val parametersJson = """{
         "type":"object",
         "properties":{
@@ -211,6 +213,7 @@ class SearchAndLaunchAppTool : QuroTool {
         val intent = context.packageManager.getLaunchIntentForPackage(target.packageName)
             ?: return "找到 ${target.label} 但无法启动"
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ExternalUiTargetSession.remember(context, target.packageName)
         context.startActivity(intent)
         return "已为您打开 ${target.label}"
     }
@@ -224,16 +227,27 @@ private data class AppMatch(val packageName: String, val label: String)
 
 private fun findAppByName(ctx: Context, name: String): AppMatch? {
     val q = name.lowercase()
-    // 1) PackageManager（受包可见性限制但最快）
-    val pmCandidates = ctx.packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
-        .map { it to ctx.packageManager.getApplicationLabel(it).toString() }
-        .filter { it.second.lowercase().contains(q) }
-        .sortedBy { it.second }
+    val pm = ctx.packageManager
+    // Only inspect launchable activities. The old implementation synchronously loaded metadata
+    // and labels for every installed package before filtering (331 packages on the test device),
+    // which could hold search_in_app for tens of seconds before the target app was even launched.
+    val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    val pmCandidates = pm.queryIntentActivities(launcherIntent, PackageManager.MATCH_ALL)
+        .asSequence()
+        .mapNotNull { info ->
+            val packageName = info.activityInfo?.packageName ?: return@mapNotNull null
+            val label = runCatching { info.loadLabel(pm).toString() }.getOrNull()?.trim().orEmpty()
+            if (label.isEmpty() || !label.lowercase().contains(q)) null
+            else AppMatch(packageName, label)
+        }
+        .distinctBy { it.packageName }
+        .sortedBy { it.label }
+        .toList()
     if (pmCandidates.isNotEmpty()) {
-        val exact = pmCandidates.firstOrNull { it.second.equals(name, ignoreCase = true) }
-        val startsWith = pmCandidates.firstOrNull { it.second.lowercase().startsWith(q) }
+        val exact = pmCandidates.firstOrNull { it.label.equals(name, ignoreCase = true) }
+        val startsWith = pmCandidates.firstOrNull { it.label.lowercase().startsWith(q) }
         val target = exact ?: startsWith ?: pmCandidates.first()
-        return AppMatch(target.first.packageName, target.second)
+        return target
     }
     // PackageManager 已声明 QUERY_ALL_PACKAGES，可见全部应用；无 shell 兜底
     return null

@@ -28,45 +28,24 @@ class QuroToolRouter(allSpecs: List<QuroToolSpec>) {
          * 模型无需先 discovery 即可调用（对应「AI 百分百先看哪些」）。
          * 其余工具经 tool_router 按需加载。
          */
-        val ALWAYS_ON: Set<String> = setOf(
-            "get_current_time", "get_device_info", "calculate", "get_battery",
-            "get_wifi_info", "get_network_info", "get_sensors", "get_clipboard", "set_clipboard",
-            "vibrate",
-            "list_installed_apps", "launch_app", "search_and_launch_app", "get_package_name",
-            "get_active_notifications", "get_bluetooth_status", "toggle_flashlight",
-            "read_sms", "send_sms", "read_contacts",
-            "execute_intent", "send_broadcast",
-            "read_calendar", "write_calendar", "get_location", "geocode",
-            "list_files", "read_text_file", "browse_files", "file_read",
-            "write_file", "delete_file", "make_directory", "move_file", "copy_file", "find_files", "file_info",
-            "http_request", "open_web", "ai_browser",
-            "run_code", "creative_studio",
-            "terminal_run", "terminal_exec", "terminal_write", "terminal_kill", "terminal_status", "quroterm_exec",
-            "speak", "stop_speak",
-            "set_alarm", "schedule_task", "list_scheduled_tasks", "delete_scheduled_task",
-            "memory_save", "memory_list", "memory_search", "memory_delete",
-            "experience_log", "experience_query", "experience_correct", "experience_version_check",
-            "knowledge_search", "knowledge_add", "knowledge_manage", "knowledge_rag_search",
-            "aiwps_create", "chat_doc", "enhanced_doc_create",
-            "ui_card", "ui_widget", "ui_control",
-            "mcp_servers", "mcp_list_tools", "mcp_call", "mcp_deploy", "mcp_undeploy", "mcp_list_local",
-            "mcp_aci_list", "mcp_aci_call", "mcp_aci_bridge",
-            "auth_service_add", "auth_service_list", "auth_service_remove",
-            "cms_list", "cms_call", "cms_status", "cms_logs", "cms_result", "cms_run_dag",
-            "cms_deploy_terminal", "cms_undeploy_terminal", "priv_status", "cms_engine_status",
+        val ALWAYS_ON: Set<String> = linkedSetOf(
+            // 高频轻量能力。
+            "get_current_time", "calculate",
+            // P40 手机操作闭环：启动 → 感知 → 定位 → 操作 → 输入 → 回读。
+            "launch_app", "search_and_launch_app", "get_package_name",
+            "get_foreground_app", "get_screen_state", "read_screen", "find_ui_element",
+            "tap_screen", "swipe_screen", "long_press_screen", "input_text", "search_in_app", "activate_app_search", "paste_focused_text", "send_message_in_app", "scroll_screen", "global_action",
+            // 无障碍低置信度时可立即走视觉，不额外增加一次路由往返。
+            "screenshot", "visual_analysis",
+            // ZorvBrowser/第三方 App 的结构化操作入口。
             "aci_list", "aci_call",
-            "workspace_write", "workspace_read", "workspace_list",
-            "read_screen", "get_foreground_app", "get_screen_state",
-            "tap_screen", "swipe_screen", "long_press_screen", "input_text",
-            "scroll_screen", "global_action",
-            "ai_type_text", "ai_press_enter", "ai_press_send",
-            "local_music_player", "local_video_player", "list_media", "music_play",
-            "shizuku_exec", "shizuku_root_exec", "freeze_app", "install_app", "shizuku_status",
-            "lock_screen", "device_admin_status", "set_camera_disabled",
-            "root_exec", "root_status",
-            "linux_run", "linux_install", "linux_start", "linux_stop", "linux_status",
-            "fluid_cloud_notify",
         )
+
+        /** 对话中动态加载的工具最多保留 12 个，防止长任务再次退化成全量下发。 */
+        internal const val MAX_LOADED = 12
+
+        /** intent 路由一次自动装载最相关的少量工具，省掉一次 get_schema 往返。 */
+        internal const val AUTO_LOAD_MATCHES = 6
 
         private val CATALOG_PARAMS_JSON = """{
   "type": "object",
@@ -94,6 +73,7 @@ class QuroToolRouter(allSpecs: List<QuroToolSpec>) {
     fun setSpecs(specs: List<QuroToolSpec>) {
         allSpecs = specs
         specByName = specs.associateBy { it.name }
+        loaded.retainAll(specByName.keys)
     }
 
     fun reset() = loaded.clear()
@@ -127,7 +107,6 @@ class QuroToolRouter(allSpecs: List<QuroToolSpec>) {
     // ───────────────────────── tool_router 目录工具 ─────────────────────────
 
     private fun catalogSpec(): QuroToolSpec {
-        val index = buildCompactIndex()
         val desc = buildString {
             appendLine("# 工具路由目录（按需加载，禁止瞎猜工具名）")
             appendLine("你拥有大量工具，但每轮只下发【已加载】工具的【真实可执行 schema】。先用本工具检索，再调用。")
@@ -139,10 +118,10 @@ class QuroToolRouter(allSpecs: List<QuroToolSpec>) {
             appendLine("- `list_tools(category=\"分类名\")`：查看某分类下的工具。")
             appendLine("- `get_directory_summary()`：全部工具速查。")
             appendLine()
-            appendLine("## 当前已加载（可直接调用，无需再查）：${if (loaded.isEmpty()) "（暂无可调，先调 get_schema 加载你需要的）" else loaded.joinToString(", ")}")
+            appendLine("## 当前已动态加载：${if (loaded.isEmpty()) "（无）" else loaded.joinToString(", ")}")
             appendLine()
-            appendLine("## 全部工具分类索引（name：一句话说明）—— 找工具先从这里看：")
-            appendLine(index)
+            appendLine("## 分类概览")
+            appendLine(buildCategorySummary())
         }
         return QuroToolSpec("tool_router", desc, CATALOG_PARAMS_JSON)
     }
@@ -154,7 +133,7 @@ class QuroToolRouter(allSpecs: List<QuroToolSpec>) {
             return "未找到工具：$toolName\n可用工具见 list_categories() / match_intent(intent=...)。" +
                 "已加载的可直接调用：${if (loaded.isEmpty()) "（无）" else loaded.joinToString(", ")}"
         }
-        loaded.add(toolName) // 标记加载：下一轮真实 schema 进入 tools，模型即可直接调用
+        load(toolName) // 标记加载：下一轮真实 schema 进入 tools，模型即可直接调用
         val info = ToolCapabilityDirectory.getToolInfo(toolName)
         return buildString {
             appendLine("## ✅ 已加载工具：$toolName（下一轮起可直接调用，无需再查）")
@@ -209,18 +188,35 @@ class QuroToolRouter(allSpecs: List<QuroToolSpec>) {
     private fun matchIntent(intent: String): String {
         if (intent.isBlank()) return "请提供用户意图，例如：match_intent(intent=\"打开网页并搜索资料\")"
         val names = allSpecs.map { it.name }.toSet()
-        val matched = ToolCapabilityDirectory.matchToolsByIntent(intent).filter { it.name in names }
+        val matched = ToolCapabilityDirectory.matchToolsByIntent(intent)
+            .filter { it.name in names }
+            .sortedByDescending { it.priority }
         if (matched.isEmpty()) {
             return "未找到匹配「$intent」的工具。可用分类见 list_categories()；或 get_schema(name=...) 直接加载你知道名字的工具。"
         }
+        val selected = matched.take(AUTO_LOAD_MATCHES)
+        selected.forEach { load(it.name) }
         return buildString {
             appendLine("## 意图匹配：「$intent」")
-            matched.sortedByDescending { it.priority }.forEachIndexed { i, t ->
+            selected.forEachIndexed { i, t ->
                 appendLine("${i + 1}. **${t.name}**（${(t.category?.displayName ?: "通用")}）：${t.description}")
             }
             appendLine()
-            appendLine("调用 get_schema(name=工具名) 加载并查看完整参数后使用。")
+            appendLine("以上工具已自动加载；下一轮可直接按 tools 中的真实参数 Schema 调用。")
         }
+    }
+
+    private fun load(toolName: String) {
+        if (toolName in ALWAYS_ON) return
+        loaded.remove(toolName)
+        loaded.add(toolName)
+        while (loaded.size > MAX_LOADED) loaded.remove(loaded.first())
+    }
+
+    /** 常驻目录只给分类和数量；完整 name+description 仅在模型主动查询时返回。 */
+    private fun buildCategorySummary(): String {
+        val byCat = allSpecs.groupBy { categorize(it.name)?.displayName ?: "其他工具" }
+        return byCat.toSortedMap().entries.joinToString("\n") { (cat, tools) -> "- $cat：${tools.size} 个" }
     }
 
     /** 紧凑分类索引：按分类聚合全部工具的 name+一句话说明（替代旧的全量 tools 字段）。 */
@@ -249,7 +245,7 @@ class QuroToolRouter(allSpecs: List<QuroToolSpec>) {
                 ToolCapabilityDirectory.ToolCategory.TERMINAL_LINUX
             name.startsWith("ui_") -> ToolCapabilityDirectory.ToolCategory.UI_CARDS
             name.startsWith("skill__") -> ToolCapabilityDirectory.ToolCategory.AI_CAPABILITIES
-            name in setOf("read_screen", "tap_screen", "swipe_screen", "long_press_screen", "scroll_screen",
+            name in setOf("read_screen", "find_ui_element", "tap_screen", "swipe_screen", "long_press_screen", "scroll_screen",
                 "input_text", "get_foreground_app", "get_screen_state", "screenshot", "screenshot_base64",
                 "visual_analysis", "visual_question", "visual_action", "visual_popup", "visual_custom_popup") ->
                 ToolCapabilityDirectory.ToolCategory.ACCESSIBILITY

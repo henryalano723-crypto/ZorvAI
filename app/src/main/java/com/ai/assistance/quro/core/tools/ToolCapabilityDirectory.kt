@@ -476,6 +476,30 @@ object ToolCapabilityDirectory {
             relatedTools = listOf("scroll_screen", "tap_screen"),
             priority = 4
         ),
+
+        "activate_app_search" to ToolInfo(
+            name = "activate_app_search",
+            category = ToolCategory.ACCESSIBILITY,
+            description = "激活当前应用顶部全局搜索入口",
+            useCases = listOf("打开应用搜索框", "点顶部放大镜", "进入联系人搜索"),
+            examples = listOf("activate_app_search()"),
+            parameters = emptyMap(),
+            tips = listOf("节点树为空时使用本地视觉识别", "只激活搜索，不代表完整任务结束"),
+            relatedTools = listOf("search_in_app", "send_message_in_app", "visual_analysis"),
+            priority = 5
+        ),
+
+        "paste_focused_text" to ToolInfo(
+            name = "paste_focused_text",
+            category = ToolCategory.ACCESSIBILITY,
+            description = "向已经聚焦的自绘输入框可靠输入 Unicode 文字",
+            useCases = listOf("微信搜索框已经聚焦后输入中文", "自绘消息框输入正文"),
+            examples = listOf("paste_focused_text(text=\"文件传输助手\")"),
+            parameters = mapOf("text" to "要输入的完整文字"),
+            tips = listOf("仅在输入法已经出现时使用", "派发后必须截图核对，不能直接报告完成"),
+            relatedTools = listOf("activate_app_search", "visual_analysis", "send_message_in_app"),
+            priority = 5
+        ),
         
         // ═══════════════ 应用管理 ═══════════════
         "launch_app" to ToolInfo(
@@ -501,8 +525,37 @@ object ToolCapabilityDirectory {
             relatedTools = listOf("launch_app", "search_and_launch_app"),
             priority = 3
         ),
+
+        "search_in_app" to ToolInfo(
+            name = "search_in_app",
+            category = ToolCategory.APP_MANAGEMENT,
+            description = "在指定应用中完成纯搜索事务",
+            useCases = listOf("在淘宝搜索商品", "在微信只查找联系人", "在应用内搜索内容"),
+            examples = listOf("search_in_app(app_name=\"微信\", query=\"文件传输助手\")"),
+            parameters = mapOf("app_name" to "目标应用显示名", "query" to "搜索内容"),
+            tips = listOf("只适用于搜索本身就是最终目标", "发送、回复、转发任务必须改用send_message_in_app"),
+            relatedTools = listOf("activate_app_search", "send_message_in_app", "visual_analysis"),
+            priority = 5
+        ),
         
         // ═══════════════ 通信 ═══════════════
+        "send_message_in_app" to ToolInfo(
+            name = "send_message_in_app",
+            category = ToolCategory.COMMUNICATION,
+            description = "在聊天应用中搜索联系人、核对会话、输入并按授权发送文字",
+            useCases = listOf("用微信给文件传输助手发消息", "搜索联系人并回复", "在聊天App发送文字"),
+            examples = listOf("send_message_in_app(app_name=\"微信\", contact=\"文件传输助手\", message=\"测试\", confirm_send=true)"),
+            parameters = mapOf(
+                "app_name" to "目标聊天应用",
+                "contact" to "必须精确匹配的联系人或群聊",
+                "message" to "完整正文",
+                "confirm_send" to "用户是否明确授权立即发送"
+            ),
+            tips = listOf("发送意图优先于纯搜索", "自绘页面必须按transaction_id和stage逐轮截图核对", "只有MESSAGE_SEND_CONFIRMED才算已发送"),
+            relatedTools = listOf("search_in_app", "paste_focused_text", "visual_analysis"),
+            priority = 5
+        ),
+
         "send_sms" to ToolInfo(
             name = "send_sms",
             category = ToolCategory.COMMUNICATION,
@@ -620,8 +673,8 @@ object ToolCapabilityDirectory {
             category = ToolCategory.APP_MANAGEMENT,
             description = "调用第三方App的ACI能力",
             useCases = listOf("让XX App帮我做YY", "调起外部App的能力", "用浏览器打开网页"),
-            examples = listOf("aci_call(capability=\"browser_open\", args={url:\"https://example.com\"})"),
-            parameters = mapOf("target_package" to "目标包名（可选）", "capability" to "能力名", "args" to "参数"),
+            examples = listOf("aci_call(target_package=\"com.ai.assistance.quro.browser\", capability=\"browser_open\", args={url:\"https://example.com\"})"),
+            parameters = mapOf("target_package" to "目标 ACI 包名（必填）", "capability" to "能力名", "args" to "参数"),
             tips = listOf("可省略target_package用默认应用", "先用aci_list查看可用能力", "支持多种能力组合"),
             relatedTools = listOf("aci_list", "browser_open"),
             priority = 5

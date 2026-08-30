@@ -290,6 +290,7 @@ fun buildQuroRegistry(context: Context? = null): QuroToolRegistry {
     // ═════════════ L1 无障碍控屏（CapOS 通道，需无障碍服务已授权）══════════════
     // 屏幕感知：读取界面 / 前台应用 / 屏幕状态
     r.register(ReadScreenTool())
+    r.register(FindUiElementTool())
     r.register(GetForegroundAppTool())
     r.register(GetScreenStateTool())
     // 屏幕操控：点击 / 长按 / 滑动 / 输入文本 / 滚动 / 全局动作
@@ -297,6 +298,10 @@ fun buildQuroRegistry(context: Context? = null): QuroToolRegistry {
     r.register(LongPressScreenTool())
     r.register(SwipeScreenTool())
     r.register(InputTextTool())
+    r.register(SearchInAppTool())
+    r.register(ActivateAppSearchTool())
+    r.register(PasteFocusedTextTool())
+    r.register(SendMessageInAppTool())
     // AI 智能体键盘（Agent IME）：ai_type_text / ai_press_enter / ai_press_send，走 IME 通道把文本打入聚焦输入框
     r.register(AiKeyboardTypeTool())
     r.register(AiKeyboardPressEnterTool())
@@ -409,7 +414,7 @@ fun buildQuroRegistry(context: Context? = null): QuroToolRegistry {
     // UI 导航工具集：让 AI 能操控自己的界面（ui_* 命名规范）
     registerUiTools(r)
     // 流体云工具：控制OPPO流体云，显示状态栏胶囊和卡片
-    r.register(FluidCloudTool(context!!))
+    context?.let { r.register(FluidCloudTool(it)) }
     // 对话框文档工具：AI在对话框内直接写文档并渲染显示
     r.register(ChatDocTool())          // 对话框文档（Markdown/HTML/代码/文本）
     // 并入「导入工具」（AI 自写 / 用户粘贴 JSON 导入），使其可被 AI 调用

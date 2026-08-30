@@ -1,6 +1,8 @@
 package com.ai.assistance.quro.core.tools
 
 import android.content.Context
+import android.content.Intent
+import android.app.ActivityManager
 import android.accessibilityservice.AccessibilityService
 import android.graphics.Path
 import android.graphics.Rect
@@ -8,11 +10,175 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.util.DisplayMetrics
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import com.ai.assistance.quro.service.QuroAccessibilityService
+import com.ai.assistance.quro.core.privilege.QuroShizukuBridge
 import org.json.JSONObject
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+
+/** 兼容以 AccessibilityService 基类传递的内部手势辅助方法。 */
+private fun AccessibilityService.actionableRoot(): AccessibilityNodeInfo? =
+    (this as? QuroAccessibilityService)?.actionableRoot() ?: rootInActiveWindow
+
+/** 让后续读屏/点击继续作用于 Zorv 刚打开的目标 App，而不是 Zorv 自己。 */
+internal object ExternalUiTargetSession {
+    private const val TAG = "ExternalUiTargetSession"
+    private const val PREFS = "external_ui_target"
+    private const val MAX_AGE_MS = 15 * 60 * 1000L
+
+    fun remember(context: Context, packageName: String) {
+        if (packageName.isBlank() || packageName == context.packageName) return
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("package", packageName)
+            .remove("task_id")
+            .remove("top_activity")
+            .putLong("updated_at", System.currentTimeMillis())
+            .apply()
+        // The task is created asynchronously after startActivity. Capture its identity once it
+        // exists so returning from Zorv can restore the exact task stack instead of relaunching
+        // the package's launcher activity.
+        Thread {
+            runCatching {
+                Thread.sleep(700L)
+                captureTask(context.applicationContext, packageName)
+            }.onFailure { Log.e(TAG, "Unable to capture external task identity", it) }
+        }.start()
+    }
+
+    private fun current(context: Context): String? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (System.currentTimeMillis() - prefs.getLong("updated_at", 0L) > MAX_AGE_MS) return null
+        return prefs.getString("package", null)?.takeIf { it.isNotBlank() && it != context.packageName }
+    }
+
+    internal fun rememberedPackage(context: Context): String? = current(context)
+
+    fun rootForAutomation(service: QuroAccessibilityService): AccessibilityNodeInfo? {
+        val root = service.actionableRoot()
+        val target = current(service) ?: return root
+        val foreground = root?.packageName?.toString()
+        if (foreground == target) {
+            // remember() already captures task identity asynchronously. Never issue a synchronous
+            // Shizuku dumpsys on every read/tap/input: a degraded Shizuku UserService can otherwise
+            // hold an already-successful UI action until the caller times out and retries it.
+            return root
+        }
+        // Never silently operate on an unrelated external app. The old behaviour accepted any
+        // non-Zorv root here, which allowed a stale instruction to click the wrong application.
+        if (foreground != service.packageName) return null
+
+        val prefs = service.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val taskId = prefs.getInt("task_id", -1).takeIf { it >= 0 }
+            ?: discoverTask(service, target)?.taskId
+            ?: return null
+        val activityManager = service.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        runCatching { activityManager.moveTaskToFront(taskId, ActivityManager.MOVE_TASK_WITH_HOME) }
+            .getOrElse { return null }
+        repeat(8) {
+            Thread.sleep(200)
+            val resumed = service.actionableRoot()
+            if (resumed?.packageName?.toString() == target) return resumed
+        }
+        return null
+    }
+
+    internal data class TaskIdentity(val taskId: Int, val topActivity: String)
+
+    internal fun parseTaskIdentity(output: String, packageName: String): TaskIdentity? {
+        if (!packageName.matches(Regex("[A-Za-z0-9_.]+"))) return null
+        val blocks = output.split(Regex("(?m)^\\s*\\* Recent #"))
+        for (block in blocks) {
+            val belongsToTarget = Regex("(?:A=\\d+:|pkg=|\\{|/)$packageName(?:\\s|/|\\})")
+                .containsMatchIn(block)
+            if (!belongsToTarget) continue
+            val taskId = Regex("\\btaskId=(\\d+)").find(block)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: Regex("Task\\{[^#]*#(\\d+)").find(block)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: continue
+            // Do not use a brace regex here. Android's ICU regex rejects a closing literal `}`
+            // which the desktop JVM Pattern implementation accepts, so JVM tests alone cannot
+            // prove that expression is safe on a device.
+            val top = block.substringAfter("topActivity={", "")
+                .substringBefore("}", "")
+                .takeIf { it.isNotBlank() }
+                ?: Regex("mActivityComponent=([^\\s]+)").find(block)?.groupValues?.getOrNull(1)
+                ?: ""
+            return TaskIdentity(taskId, top)
+        }
+        return null
+    }
+
+    private fun captureTask(context: Context, packageName: String) {
+        val identity = discoverTask(context, packageName) ?: return
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt("task_id", identity.taskId)
+            .putString("top_activity", identity.topActivity)
+            .putLong("updated_at", System.currentTimeMillis())
+            .apply()
+    }
+
+    private fun discoverTask(context: Context, packageName: String): TaskIdentity? {
+        if (!packageName.matches(Regex("[A-Za-z0-9_.]+"))) return null
+        return runCatching {
+            val output = QuroShizukuBridge.exec(context, "dumpsys activity recents")
+            if (output.startsWith("❌")) null else parseTaskIdentity(output, packageName)
+        }.onFailure { Log.e(TAG, "Unable to parse external task identity", it) }.getOrNull()
+    }
+}
+
+private fun compactUiFingerprint(root: AccessibilityNodeInfo): Int {
+    var hash = 1
+    var visited = 0
+    fun visit(node: AccessibilityNodeInfo?, depth: Int) {
+        if (node == null || depth > 16 || visited++ >= 400) return
+        val b = Rect().also { node.getBoundsInScreen(it) }
+        hash = 31 * hash + listOf(
+            node.packageName, node.viewIdResourceName, node.text, node.contentDescription,
+            b.left, b.top, b.right, b.bottom,
+        ).hashCode()
+        for (i in 0 until node.childCount.coerceAtMost(60)) visit(node.getChild(i), depth + 1)
+    }
+    visit(root, 0)
+    return hash
+}
+
+/** Screenshot coordinates and Accessibility gestures both use the physical display space. */
+private fun physicalDisplaySize(context: Context): Pair<Int, Int> {
+    val metrics = DisplayMetrics()
+    @Suppress("DEPRECATION")
+    val display = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay
+    @Suppress("DEPRECATION")
+    display.getRealMetrics(metrics)
+    return metrics.widthPixels to metrics.heightPixels
+}
+
+internal fun visualFingerprint(bitmap: android.graphics.Bitmap): IntArray {
+    val grid = 24
+    return IntArray(grid * grid) { index ->
+        val gx = index % grid
+        val gy = index / grid
+        val x = ((gx + 0.5f) * bitmap.width / grid).toInt().coerceIn(0, bitmap.width - 1)
+        val y = ((gy + 0.5f) * bitmap.height / grid).toInt().coerceIn(0, bitmap.height - 1)
+        val pixel = bitmap.getPixel(x, y)
+        (android.graphics.Color.red(pixel) * 30 + android.graphics.Color.green(pixel) * 59 +
+            android.graphics.Color.blue(pixel) * 11) / 100
+    }
+}
+
+internal fun visualFingerprintsDiffer(before: IntArray, after: IntArray): Boolean {
+    if (before.size != after.size || before.isEmpty()) return true
+    var changed = 0
+    var totalDelta = 0L
+    for (i in before.indices) {
+        val delta = kotlin.math.abs(before[i] - after[i])
+        totalDelta += delta
+        if (delta >= 18) changed++
+    }
+    return changed >= before.size / 20 || totalDelta >= before.size * 5L
+}
 
 /**
  * L1 无障碍屏幕控制与感知工具集（CapOS 通道）。
@@ -37,21 +203,22 @@ class ReadScreenTool : QuroTool {
     override fun run(context: Context, arguments: String): String {
         val svc = QuroAccessibilityService.instance ?: return "❌ 无障碍服务未连接：请到 CapOS 权限子系统 → L1 无障碍服务 → 请求授权"
         return try {
-            val root = svc.rootInActiveWindow ?: return "⚠️ 无法获取当前窗口根节点（可能被系统限制）"
+            val root = ExternalUiTargetSession.rootForAutomation(svc)
+                ?: return "❌ 无法恢复刚才的目标 App，已停止；不会读取或操作 Zorv 自己"
             val sb = StringBuilder()
             appendNode(root, sb, 0)
             // 另收集可交互元素（clickable/editable/scrollable）做索引，便于 AI 定位「发送/输入框」等
             val interactive = mutableListOf<String>()
             collectInteractive(root, interactive, 0)
             val tree = sb.toString()
-            val cappedTree = if (tree.length > 6000) {
-                "${tree.take(6000)}\n... (节点树截断，见下方可交互元素索引)"
+            val cappedTree = if (tree.length > 2400) {
+                "${tree.take(2400)}\n... (节点树截断，见下方可交互元素索引)"
             } else tree
             val inter = if (interactive.isNotEmpty())
                 "\n\n## 可交互元素索引（clickable/editable/scrollable，共 ${interactive.size}）\n" +
-                    interactive.joinToString("\n")
-            else ""
-            cappedTree + inter
+                    interactive.take(30).joinToString("\n")
+            else "\n\n⚠️ 当前应用未暴露可交互节点；不要重复 read_screen，应改用一次 visual_analysis 视觉定位。"
+            (cappedTree + inter).take(3600)
         } catch (e: Exception) {
             "❌ 读取屏幕失败: ${e.message}"
         }
@@ -72,7 +239,9 @@ class ReadScreenTool : QuroTool {
             }
             out.add("· $label [${b.left},${b.top}][${b.right},${b.bottom}]$tag")
         }
-        for (i in 0 until node.childCount.coerceAtMost(50)) collectInteractive(node.getChild(i), out, depth + 1)
+        for (i in 0 until node.childCount.coerceAtMost(50)) {
+            node.getChild(i)?.let { collectInteractive(it, out, depth + 1) }
+        }
     }
 
     private fun appendNode(node: AccessibilityNodeInfo?, sb: StringBuilder, depth: Int) {
@@ -103,6 +272,95 @@ class ReadScreenTool : QuroTool {
 }
 
 /** 获取当前前台应用信息（Activity 组件名）。 */
+/** 按目标词定向查找控件，只返回少量匹配项，避免把整棵无障碍树回传给模型。 */
+class FindUiElementTool : QuroTool {
+    override val name = "find_ui_element"
+    override val description = "按文字、内容描述或资源ID定向查找当前屏幕控件，返回匹配项坐标。查询搜索栏时会统一识别搜索入口和可编辑搜索框，并给出下一步。"
+    override val parametersJson = """{"type":"object","properties":{"query":{"type":"string","description":"目标词，如 搜索、提交、输入框"},"max_results":{"type":"integer","minimum":1,"maximum":12,"default":6}},"required":["query"]}"""
+
+    override fun run(context: Context, arguments: String): String {
+        val svc = QuroAccessibilityService.instance
+            ?: return "❌ 无障碍服务未连接：请到 CapOS 权限子系统开启"
+        val args = runCatching { JSONObject(arguments) }.getOrElse { JSONObject() }
+        val query = args.optString("query").trim()
+        if (query.isEmpty()) return "❌ query 不能为空"
+        val limit = args.optInt("max_results", 6).coerceIn(1, 12)
+        val root = svc.actionableRoot() ?: return "⚠️ 无法获取当前窗口根节点"
+        val matches = mutableListOf<String>()
+        val searchNodes = mutableListOf<SearchTargetResolver.Node>()
+        val searchIntent = SearchTargetResolver.isSearchIntent(query)
+        var visited = 0
+
+        fun visit(node: AccessibilityNodeInfo?) {
+            if (node == null || visited++ >= 1200) return
+            val text = node.text?.toString().orEmpty()
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) node.hintText?.toString().orEmpty() else ""
+            val desc = node.contentDescription?.toString().orEmpty()
+            val rid = node.viewIdResourceName.orEmpty()
+            val cls = node.className?.toString().orEmpty()
+            val b = Rect().also { node.getBoundsInScreen(it) }
+            if (searchIntent && node.isVisibleToUser) {
+                searchNodes += SearchTargetResolver.Node(
+                    text = text,
+                    hint = hint,
+                    description = desc,
+                    resourceId = rid,
+                    className = cls,
+                    left = b.left,
+                    top = b.top,
+                    right = b.right,
+                    bottom = b.bottom,
+                    clickable = node.isClickable,
+                    editable = node.isEditable,
+                    enabled = node.isEnabled,
+                )
+            }
+            val haystack = "$text\n$desc\n$rid\n$cls"
+            if (!searchIntent && matches.size < limit && haystack.contains(query, ignoreCase = true)) {
+                val label = listOf(text, desc, rid.substringAfterLast(':')).firstOrNull { it.isNotBlank() }
+                    ?.take(60) ?: cls.substringAfterLast('.').take(40)
+                val flags = buildList {
+                    if (node.isEditable) add("editable")
+                    if (node.isClickable) add("clickable")
+                    if (node.isScrollable) add("scrollable")
+                }.joinToString(",")
+                matches += "· $label [${b.left},${b.top}][${b.right},${b.bottom}]${if (flags.isBlank()) "" else " [$flags]"}"
+            }
+            for (i in 0 until node.childCount.coerceAtMost(60)) node.getChild(i)?.let(::visit)
+        }
+        visit(root)
+        if (searchIntent) {
+            val candidates = SearchTargetResolver.rank(searchNodes).take(limit)
+            if (candidates.isEmpty()) {
+                return "⚠️ 未找到搜索候选（已检查 $visited 个节点）。只使用一次 visual_analysis 视觉定位；不要盲目滑动或重复同类查找。"
+            }
+            val rendered = candidates.mapIndexed { index, candidate ->
+                val node = candidate.node
+                val label = listOf(node.text, node.hint, node.description, node.resourceId.substringAfterLast(':'))
+                    .firstOrNull { it.isNotBlank() }?.take(60) ?: node.className.substringAfterLast('.').take(40)
+                val locator = buildList {
+                    if (node.resourceId.isNotBlank()) add("target_resource_id=\"${node.resourceId.take(100)}\"")
+                    add("target_x=${node.centerX}")
+                    add("target_y=${node.centerY}")
+                }.joinToString(",")
+                val next = when (candidate.kind) {
+                    SearchTargetResolver.Kind.EDITABLE_FIELD -> "用上述定位参数调用 input_text"
+                    SearchTargetResolver.Kind.SEARCH_ENTRY -> "tap_screen 点击一次，然后重新 read_screen；不要直接输入"
+                }
+                "${index + 1}. 类型=${candidate.kind} 标签=$label " +
+                    "[${node.left},${node.top}][${node.right},${node.bottom}] " +
+                    "定位={$locator} 依据=${candidate.reasons.joinToString("+")} 下一步=$next"
+            }
+            return "✅ 找到 ${candidates.size} 个搜索候选（按可靠性排序，前台=${root.packageName}）：\n${rendered.joinToString("\n")}"
+        }
+        return if (matches.isEmpty()) {
+            "⚠️ 未找到“$query”（已检查 $visited 个节点）。不要重复读取整棵树；只使用一次 visual_analysis 视觉定位。"
+        } else {
+            "✅ 找到 ${matches.size} 个“$query”匹配项（前台=${root.packageName}）：\n${matches.joinToString("\n")}"
+        }
+    }
+}
+
 class GetForegroundAppTool : QuroTool {
     override val name = "get_foreground_app"
     override val description = "获取当前前台应用包名与 Activity 名称，无需参数 {}。"
@@ -110,7 +368,7 @@ class GetForegroundAppTool : QuroTool {
     override fun run(context: Context, arguments: String): String {
         val svc = QuroAccessibilityService.instance ?: return "❌ 无障碍服务未连接"
         return try {
-            val root = svc.rootInActiveWindow ?: return "⚠️ 无法获取窗口信息"
+            val root = svc.actionableRoot() ?: return "⚠️ 无法获取窗口信息"
             // 从根节点的 packageName 和 Activity 的 viewId 推断
             val pkg = root.packageName?.toString() ?: "未知"
             // Android 5+ 可通过 WindowManager 或 UsageStats 辅助确认
@@ -145,7 +403,8 @@ class GetScreenStateTool : QuroTool {
             }
         } catch (_: Exception) { "未知" }
         val dm = context.resources.displayMetrics
-        return """{"screen_on":true,"rotation":"$rotation","width_px":${dm.widthPixels},"height_px":${dm.heightPixels},"density":${dm.densityDpi}}"""
+        val (physicalWidth, physicalHeight) = physicalDisplaySize(context)
+        return """{"screen_on":true,"rotation":"$rotation","width_px":$physicalWidth,"height_px":$physicalHeight,"density":${dm.densityDpi},"coordinate_space":"physical_display"}"""
     }
 }
 
@@ -192,13 +451,20 @@ class TapScreenTool : QuroTool {
         }
     }
 
-    private fun clickAt(svc: AccessibilityService, x: Float, y: Float): String {
+    private fun clickAt(svc: QuroAccessibilityService, x: Float, y: Float): String {
         // 坐标越界保护：派发到屏幕外的手势在高版本可能返回 true 却什么都不做（语义成功≠执行成功）
-        val dm = svc.resources.displayMetrics
-        if (x < 0 || y < 0 || x > dm.widthPixels || y > dm.heightPixels)
-            return "❌ 坐标越界(屏幕 ${dm.widthPixels}×${dm.heightPixels}): (${x.toInt()},${y.toInt()})"
+        val (screenWidth, screenHeight) = physicalDisplaySize(svc)
+        if (x < 0 || y < 0 || x >= screenWidth || y >= screenHeight)
+            return "❌ 坐标越界(物理屏幕 ${screenWidth}×${screenHeight}): (${x.toInt()},${y.toInt()})"
 
-        val root = svc.rootInActiveWindow ?: return "⚠️ 无法获取当前窗口根节点（可能被系统限制）"
+        val root = ExternalUiTargetSession.rootForAutomation(svc)
+            ?: return "❌ 无法恢复刚才的目标 App，已停止点击；不会误点 Zorv"
+        if (root.packageName?.toString() == svc.packageName)
+            return "❌ 当前仍是 Zorv，已拒绝对自身界面执行外部点击"
+        val beforePage = compactUiFingerprint(root)
+        val beforeVisual = ScreenshotTool().captureWithAccessibility(svc)?.let { bitmap ->
+            try { visualFingerprint(bitmap) } finally { bitmap.recycle() }
+        }
         // 坐标模式：用户给了明确坐标 → 在 (x,y) 精确派发触摸。
         // 关键修复：不再重定向到「可点击祖先的中心」。此前命中一个整行宽度的列表项时，
         // 会去点该容器的中心，导致指定 x=980 实际点中 x=540（系统性坐标偏移）。
@@ -211,13 +477,13 @@ class TapScreenTool : QuroTool {
         return if (dispatched) {
             val target = hit?.let { findClickableAncestor(it) } ?: hit
             if (target?.isCheckable == true) verifyToggle(svc, x, y, target.isChecked)
-            else "✅ 已点击「$label」(坐标 ${x.toInt()},${y.toInt()}，精确坐标触摸)"
+            else verifyPageChange(svc, beforePage, beforeVisual, label)
         } else {
             // 手势被拒：降级到 performAction（不认坐标，只能点元素本身）
             val target = hit?.let { findClickableAncestor(it) } ?: hit
             if (target != null) {
                 val ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                if (ok) "✅ 已点击「$label」(performAction 降级，坐标 ${x.toInt()},${y.toInt()})"
+                if (ok) verifyPageChange(svc, beforePage, beforeVisual, label)
                 else "❌ 点击「$label」失败（手势与 performAction 均被拒，可能 UI 未就绪）"
             } else "❌ 轻触手势被系统拒绝派发且坐标处无节点"
         }
@@ -229,12 +495,34 @@ class TapScreenTool : QuroTool {
      */
     private fun verifyToggle(svc: AccessibilityService, cx: Float, cy: Float, before: Boolean): String {
         Thread.sleep(300)
-        val root = svc.rootInActiveWindow ?: return "✅ 已派发点击(可勾选节点，回读失败)"
+        val root = svc.actionableRoot() ?: return "✅ 已派发点击(可勾选节点，回读失败)"
         val hit = hitTestNode(root, cx, cy)
         val node = (hit?.let { findClickableAncestor(it) } ?: hit) ?: return "✅ 已派发点击(可勾选节点，回读失败)"
         val after = node.isChecked
         return if (after != before) "✅ 已点击并确认状态翻转($before→$after)（真实节点中心触摸）"
         else "⚠️ 已派发点击但状态未翻转($before)，可能点击未生效（建议重试）"
+    }
+
+    private fun verifyPageChange(
+        svc: QuroAccessibilityService,
+        before: Int,
+        beforeVisual: IntArray?,
+        label: String,
+    ): String {
+        repeat(10) {
+            Thread.sleep(250)
+            val after = svc.actionableRoot() ?: return@repeat
+            if (after.packageName?.toString() != svc.packageName && compactUiFingerprint(after) != before)
+                return "✅ 已点击「$label」，页面变化已确认"
+        }
+        if (beforeVisual != null) {
+            val changed = ScreenshotTool().captureWithAccessibility(svc)?.let { bitmap ->
+                try { visualFingerprintsDiffer(beforeVisual, visualFingerprint(bitmap)) }
+                finally { bitmap.recycle() }
+            }
+            if (changed == true) return "✅ 已点击「$label」，视觉页面变化已确认"
+        }
+        return "⚠️ 点击动作已派发，但无障碍与视觉均未确认页面变化；禁止自动重试同一坐标"
     }
 
     /**
@@ -250,7 +538,9 @@ class TapScreenTool : QuroTool {
             if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
                 candidates.add(node to depth)
             }
-            for (i in 0 until node.childCount.coerceAtMost(80)) collect(node.getChild(i), depth + 1)
+            for (i in 0 until node.childCount.coerceAtMost(80)) {
+                node.getChild(i)?.let { collect(it, depth + 1) }
+            }
         }
         collect(root, 0)
         if (candidates.isEmpty()) return null
@@ -295,12 +585,21 @@ class TapScreenTool : QuroTool {
         return ok.get()
     }
 
-    private fun findAndClick(svc: AccessibilityService, byText: String? = null, byDesc: String? = null): String {
+    private fun findAndClick(svc: QuroAccessibilityService, byText: String? = null, byDesc: String? = null): String {
         // 按文本/描述查找（不要求节点本身可点击，因为可点监听常在父容器）；找不到则延迟重试一次（应对页面跳变）
-        var node = svc.rootInActiveWindow?.let { findNode(it, byText, byDesc, 0) }
+        var root = ExternalUiTargetSession.rootForAutomation(svc)
+            ?: return "❌ 无法恢复刚才的目标 App，已停止点击；不会误点 Zorv"
+        if (root.packageName?.toString() == svc.packageName)
+            return "❌ 当前仍是 Zorv，已拒绝对自身界面执行外部点击"
+        val beforePage = compactUiFingerprint(root)
+        val beforeVisual = ScreenshotTool().captureWithAccessibility(svc)?.let { bitmap ->
+            try { visualFingerprint(bitmap) } finally { bitmap.recycle() }
+        }
+        var node = findNode(root, byText, byDesc, 0)
         if (node == null) {
             Thread.sleep(250)
-            node = svc.rootInActiveWindow?.let { findNode(it, byText, byDesc, 0) }
+            root = ExternalUiTargetSession.rootForAutomation(svc) ?: return "❌ 目标 App 窗口已丢失"
+            node = findNode(root, byText, byDesc, 0)
         }
         if (node == null) return "❌ 未找到匹配节点: ${byText ?: byDesc}"
         // 向上回溯到可点击祖先，再点其真实中心（解决「点了文本子节点却没反应」）
@@ -312,10 +611,10 @@ class TapScreenTool : QuroTool {
         val dispatched = tapGestureAt(svc, cx, cy)
         return if (dispatched) {
             if (target.isCheckable) verifyToggle(svc, cx, cy, target.isChecked)
-            else "✅ 已点击「$label」(真实节点中心触摸)"
+            else verifyPageChange(svc, beforePage, beforeVisual, label)
         } else {
             val ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            if (ok) "✅ 已点击「$label」(performAction 降级)" else "❌ 点击「$label」失败（建议重试）"
+            if (ok) verifyPageChange(svc, beforePage, beforeVisual, label) else "❌ 点击「$label」失败（建议重试）"
         }
     }
 
@@ -331,7 +630,8 @@ class TapScreenTool : QuroTool {
             if (d == byDesc || d?.contains(byDesc) == true) return root
         }
         for (i in 0 until root.childCount.coerceAtMost(40)) {
-            val found = findNode(root.getChild(i), byText, byDesc, depth + 1)
+            val child = root.getChild(i) ?: continue
+            val found = findNode(child, byText, byDesc, depth + 1)
             if (found != null) return found
         }
         return null
@@ -365,7 +665,7 @@ class LongPressScreenTool : QuroTool {
                     Triple(x, y, "坐标(${x.toInt()},${y.toInt()})")
                 }
                 args.has("text") -> {
-                    val node = svc.rootInActiveWindow?.let { findNodeLp(it, args.getString("text"), null, 0) }
+                    val node = svc.actionableRoot()?.let { findNodeLp(it, args.getString("text"), null, 0) }
                         ?: return "❌ 未找到文本匹配节点: ${args.getString("text")}"
                     val t = findClickableAncestorLp(node) ?: node
                     val r = Rect().also { t.getBoundsInScreen(it) }
@@ -373,7 +673,7 @@ class LongPressScreenTool : QuroTool {
                         (t.text?.toString() ?: t.contentDescription?.toString() ?: args.getString("text")))
                 }
                 args.has("description") -> {
-                    val node = svc.rootInActiveWindow?.let { findNodeLp(it, null, args.getString("description"), 0) }
+                    val node = svc.actionableRoot()?.let { findNodeLp(it, null, args.getString("description"), 0) }
                         ?: return "❌ 未找到描述匹配节点: ${args.getString("description")}"
                     val t = findClickableAncestorLp(node) ?: node
                     val r = Rect().also { t.getBoundsInScreen(it) }
@@ -383,9 +683,9 @@ class LongPressScreenTool : QuroTool {
                 else -> return "❌ 缺少参数：需要 x+y / text / description 任一"
             }
             // 坐标越界保护
-            val dm = svc.resources.displayMetrics
-            if (cx < 0 || cy < 0 || cx > dm.widthPixels || cy > dm.heightPixels)
-                return "❌ 坐标越界(屏幕 ${dm.widthPixels}×${dm.heightPixels}): (${cx.toInt()},${cy.toInt()})"
+            val (screenWidth, screenHeight) = physicalDisplaySize(svc)
+            if (cx < 0 || cy < 0 || cx >= screenWidth || cy >= screenHeight)
+                return "❌ 坐标越界(物理屏幕 ${screenWidth}×${screenHeight}): (${cx.toInt()},${cy.toInt()})"
             val dispatched = dispatchLongPress(svc, cx, cy, duration)
             if (dispatched) "✅ 已长按「$label」(${cx.toInt()},${cy.toInt()}，约 ${duration}ms)"
             else "❌ 长按手势被系统拒绝派发（建议重试）"
@@ -428,7 +728,8 @@ class LongPressScreenTool : QuroTool {
         if (byText != null) { if (t == byText || t?.contains(byText) == true) return root }
         if (byDesc != null) { if (d == byDesc || d?.contains(byDesc) == true) return root }
         for (i in 0 until root.childCount.coerceAtMost(40)) {
-            val found = findNodeLp(root.getChild(i), byText, byDesc, depth + 1)
+            val child = root.getChild(i) ?: continue
+            val found = findNodeLp(child, byText, byDesc, depth + 1)
             if (found != null) return found
         }
         return null
@@ -455,9 +756,9 @@ class SwipeScreenTool : QuroTool {
         val svc = QuroAccessibilityService.instance ?: return "❌ 无障碍服务未连接"
         val args = JSONObject(arguments)
         return try {
-            val dm = context.resources.displayMetrics
-            val w = dm.widthPixels.toFloat()
-            val h = dm.heightPixels.toFloat()
+            val (screenWidth, screenHeight) = physicalDisplaySize(context)
+            val w = screenWidth.toFloat()
+            val h = screenHeight.toFloat()
             val duration = args.optLong("duration_ms", 300L)
 
             val (sx, sy, ex, ey) = if (args.has("start_x") && args.has("start_y")) {
@@ -509,59 +810,463 @@ class SwipeScreenTool : QuroTool {
 /** 在可编辑框内输入文本（先查找再输入）。 */
 class InputTextTool : QuroTool {
     override val name = "input_text"
-    override val description = "在屏幕上找到输入框并填入文本。可通过 hint/text/description 定位输入框。"
+    override val description = "在屏幕上定向找到输入框并填入文本。搜索任务必须先用 find_ui_element(query=\"搜索\") 找入口；可通过资源ID、坐标、hint/text/description 定位，多个输入框时必须明确定位。"
     override val parametersJson = """{
         "type":"object",
         "properties":{
             "text":{"type":"string","description":"要输入的文本内容（必填）"},
             "hint":{"type":"string","description":"输入框的 hint 文本（可选定位用）"},
             "target_text":{"type":"string","description":"输入框当前的文本（可选定位用）"},
-            "target_desc":{"type":"string","description":"输入框的 contentDescription（可选定位用）"}
+            "target_desc":{"type":"string","description":"输入框的 contentDescription（可选定位用）"},
+            "target_resource_id":{"type":"string","description":"输入框完整资源ID或末段ID（优先定位）"},
+            "target_x":{"type":"integer","description":"输入框内的屏幕X坐标，须与 target_y 同时提供"},
+            "target_y":{"type":"integer","description":"输入框内的屏幕Y坐标，须与 target_x 同时提供"}
         },
         "required":["text"]
     }"""
 
     override fun run(context: Context, arguments: String): String {
         val svc = QuroAccessibilityService.instance ?: return "❌ 无障碍服务未连接"
-        val args = JSONObject(arguments)
-        val text = args.optString("text", "") ?: return "❌ 缺少 text 参数"
+        val args = runCatching { JSONObject(arguments) }.getOrElse { return "❌ 参数不是有效 JSON" }
+        val text = args.optString("text", "")
+        if (text.isEmpty()) return "❌ 缺少 text 参数"
+        val hasX = args.has("target_x")
+        val hasY = args.has("target_y")
+        if (hasX != hasY) return "❌ target_x 与 target_y 必须同时提供"
         return try {
-            val root = svc.rootInActiveWindow ?: return "⚠️ 无法获取窗口根节点"
-            val target = findEditable(root, args.optString("hint"), args.optString("target_text"), args.optString("target_desc"))
-                ?: return "❌ 未找到输入框"
-            // 先粘贴到剪贴板，再执行 ACTION_PASTE
-            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-            cm.setPrimaryClip(android.content.ClipData.newPlainText("input", text))
-            Thread.sleep(100)
-            if (target.performAction(AccessibilityNodeInfo.ACTION_PASTE)) {
-                Thread.sleep(150)
-                "✅ 已输入: $text"
+            // If Zorv launched an external app, restore and validate that exact task before
+            // touching any editor.  Falling back to actionableRoot() here used to let a stale
+            // Zorv chat composer receive the external contact/search text.
+            var root = ExternalUiTargetSession.rootForAutomation(svc)
+                ?: return "❌ 无法恢复目标 App，拒绝向当前输入框写入文字"
+            var editables = collectEditables(root)
+            var snapshots = editables.map { toResolverNode(it) }
+            var selection = SearchTargetResolver.selectEditable(
+                nodes = snapshots,
+                targetResourceId = args.optNonBlank("target_resource_id"),
+                targetX = if (hasX) args.optInt("target_x") else null,
+                targetY = if (hasY) args.optInt("target_y") else null,
+                hint = args.optNonBlank("hint"),
+                targetText = args.optNonBlank("target_text"),
+                targetDescription = args.optNonBlank("target_desc"),
+            )
+            val searchIntent = SearchTargetResolver.isSearchIntent(
+                listOf(
+                    args.optString("hint"),
+                    args.optString("target_desc"),
+                    args.optString("target_resource_id"),
+                ).joinToString(" "),
+            )
+            if (selection.index == null && searchIntent) {
+                val opened = openSearchEntry(svc, root)
+                if (opened) {
+                    repeat(6) {
+                        Thread.sleep(250)
+                        root = ExternalUiTargetSession.rootForAutomation(svc) ?: return@repeat
+                        editables = collectEditables(root)
+                        if (editables.isNotEmpty()) return@repeat
+                    }
+                    snapshots = editables.map { toResolverNode(it) }
+                    selection = SearchTargetResolver.selectEditable(
+                        nodes = snapshots,
+                        targetResourceId = args.optNonBlank("target_resource_id"),
+                        targetX = null,
+                        targetY = null,
+                        hint = args.optNonBlank("hint"),
+                        targetText = args.optNonBlank("target_text"),
+                        targetDescription = args.optNonBlank("target_desc"),
+                    )
+                    // Search pages often replace the entry with one unambiguously focused
+                    // editor whose hint/description differs from the landing-page label.
+                    if (selection.index == null && editables.size == 1) {
+                        selection = SearchTargetResolver.EditableSelection(
+                            SearchTargetResolver.SelectionStatus.MATCH,
+                            index = 0,
+                        )
+                    }
+                }
+            }
+            if (selection.status == SearchTargetResolver.SelectionStatus.AMBIGUOUS) {
+                val candidates = selection.candidateIndexes.take(8).mapIndexed { index, nodeIndex ->
+                    val node = snapshots[nodeIndex]
+                    val label = listOf(node.hint, node.text, node.description, node.resourceId.substringAfterLast(':'))
+                        .firstOrNull { it.isNotBlank() } ?: node.className.substringAfterLast('.')
+                    "${index + 1}. $label [${node.left},${node.top}][${node.right},${node.bottom}] " +
+                        "target_resource_id=${node.resourceId.ifBlank { "无" }} target_x=${node.centerX} target_y=${node.centerY}"
+                }
+                return "❌ 当前有多个输入框，拒绝猜测。请根据候选传 target_resource_id 或 target_x+target_y：\n${candidates.joinToString("\n")}"
+            }
+            val selectedIndex = selection.index ?: run {
+                val externalPackage = root.packageName?.toString()
+                val hasFocusedIme = svc.windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+                if (externalPackage != null && externalPackage != context.packageName && hasFocusedIme) {
+                    return PasteFocusedTextTool().run(
+                        context,
+                        JSONObject().put("text", text).toString(),
+                    )
+                }
+                return noEditableFallback(root)
+            }
+            val target = editables[selectedIndex]
+            runCatching { target.refresh() }
+            val before = target.text?.toString().orEmpty()
+            if (inputMatches(text, before)) {
+                "✅ 输入框已经精确等于目标文字；未重复写入。禁止再次调用 input_text，请继续提交/搜索。"
             } else {
-                // 降级：尝试 ACTION_SET_TEXT（API 18+）
-                val arg = android.os.Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) }
-                if (target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arg))
-                    "✅ 已输入(setText): $text"
-                else "❌ 输入失败"
+                // Gotcha-style: ACTION_SET_TEXT atomically replaces the whole editor value.
+                // Never paste first: paste may append to an existing suggestion/value and
+                // trigger an input-method delete/reinsert loop.
+                target.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                val arg = android.os.Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                }
+                val set = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arg)
+                if (set && verifyInput(target, text)) {
+                    "✅ 已原子覆盖并回读确认 ${text.length} 个字符；禁止再次调用 input_text，请继续提交/搜索。"
+                } else {
+                    // Clipboard fallback is allowed only after an independently verified clear.
+                    val clearArgs = android.os.Bundle().apply {
+                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+                    }
+                    val cleared = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs) &&
+                        verifyInput(target, "")
+                    if (!cleared) {
+                        "❌ 无法可靠清空原文字，已停止输入以防追加和删除循环；禁止重复调用 input_text。"
+                    } else {
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("input", text))
+                        Thread.sleep(100)
+                        val pasted = target.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                        if (pasted && verifyInput(target, text)) {
+                            "✅ 已清空后粘贴并回读确认 ${text.length} 个字符；禁止再次调用 input_text，请继续提交/搜索。"
+                        } else {
+                            "❌ 清空后输入仍未通过回读验证，已停止；禁止重复调用 input_text或报告任务完成。"
+                        }
+                    }
+                }
             }
         } catch (e: Exception) {
             "❌ 输入文本失败: ${e.message}"
         }
     }
 
-    private fun findEditable(root: AccessibilityNodeInfo, hint: String?, targetText: String?, desc: String?, depth: Int = 0): AccessibilityNodeInfo? {
-        if (depth > 12) return null
-        if (root.isEditable) {
-            if (hint != null && root.hintText?.toString()?.contains(hint) == true) return root
-            if (targetText != null && root.text?.toString() == targetText) return root
-            if (desc != null && root.contentDescription?.toString()?.contains(desc) == true) return root
-            if (hint == null && targetText == null && desc == null) return root // 取第一个编辑框
+    private fun collectEditables(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
+        val result = mutableListOf<AccessibilityNodeInfo>()
+        var visited = 0
+        fun visit(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 16 || visited++ >= 1200 || result.size >= 80) return
+            if (node.isEditable && node.isVisibleToUser) result += node
+            for (i in 0 until node.childCount.coerceAtMost(60)) node.getChild(i)?.let { visit(it, depth + 1) }
         }
-        for (i in 0 until root.childCount.coerceAtMost(30)) {
-            val found = findEditable(root.getChild(i), hint, targetText, desc, depth + 1)
-            if (found != null) return found
-        }
-        return null
+        visit(root, 0)
+        return result
     }
+
+    private fun verifyInput(target: AccessibilityNodeInfo, expected: String): Boolean {
+        repeat(4) {
+            Thread.sleep(150)
+            runCatching { target.refresh() }
+            val observed = runCatching { target.text?.toString().orEmpty() }.getOrDefault("")
+            if (inputMatches(expected, observed)) return true
+        }
+        return false
+    }
+
+    companion object {
+        internal fun inputMatches(expected: String, observed: String): Boolean =
+            normalizeInput(expected) == normalizeInput(observed)
+
+        internal fun noEditableResult(candidate: SearchTargetResolver.Candidate?): String {
+            if (candidate == null) {
+                return "❌ 未找到可编辑输入框。请重新 read_screen / find_ui_element 定位；如需视觉判断，应单独调用 visual_analysis，当前 input_text 未执行，禁止报告任务完成。"
+            }
+            val node = candidate.node
+            val locator = "target_x=${node.centerX}, target_y=${node.centerY}"
+            return when (candidate.kind) {
+                SearchTargetResolver.Kind.SEARCH_ENTRY ->
+                    "❌ 当前没有可编辑输入框；发现 SEARCH_ENTRY [$locator]。下一步只点击该入口一次并重新 read_screen；当前 input_text 未执行，禁止报告任务完成。"
+                SearchTargetResolver.Kind.EDITABLE_FIELD ->
+                    "❌ 输入框定位不明确；发现 EDITABLE_FIELD [$locator]。请用该坐标重新调用 input_text；当前没有通过输入回读验证，禁止报告任务完成。"
+            }
+        }
+
+        private fun normalizeInput(value: String): String =
+            value.replace("\r\n", "\n").replace('\r', '\n')
+    }
+
+    private fun noEditableFallback(root: AccessibilityNodeInfo): String {
+        val nodes = mutableListOf<SearchTargetResolver.Node>()
+        var visited = 0
+        fun visit(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 16 || visited++ >= 1200) return
+            if (node.isVisibleToUser) nodes += toResolverNode(node)
+            for (i in 0 until node.childCount.coerceAtMost(60)) node.getChild(i)?.let { visit(it, depth + 1) }
+        }
+        visit(root, 0)
+        // input_text 必须只表示实际输入动作。视觉截图属于感知动作，不能从这里返回
+        // {status:"captured"} 并被通用工具状态机误判为输入成功。
+        return noEditableResult(SearchTargetResolver.rank(nodes).firstOrNull())
+    }
+
+    /** Open a ranked search entry once, then let the normal editable/readback path continue. */
+    private fun openSearchEntry(svc: QuroAccessibilityService, root: AccessibilityNodeInfo): Boolean {
+        val actual = mutableListOf<AccessibilityNodeInfo>()
+        val snapshots = mutableListOf<SearchTargetResolver.Node>()
+        var visited = 0
+        fun visit(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 16 || visited++ >= 1200) return
+            if (node.isVisibleToUser) {
+                actual += node
+                snapshots += toResolverNode(node)
+            }
+            for (i in 0 until node.childCount.coerceAtMost(60)) {
+                node.getChild(i)?.let { visit(it, depth + 1) }
+            }
+        }
+        visit(root, 0)
+        val candidate = SearchTargetResolver.rank(snapshots)
+            .firstOrNull { it.kind == SearchTargetResolver.Kind.SEARCH_ENTRY }
+            ?: return false
+        val index = snapshots.indexOf(candidate.node)
+        val node = actual.getOrNull(index) ?: return false
+        if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+
+        val path = Path().apply { moveTo(candidate.node.centerX.toFloat(), candidate.node.centerY.toFloat()) }
+        val gesture = android.accessibilityservice.GestureDescription.Builder()
+            .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(path, 0L, 80L))
+            .build()
+        return svc.dispatchGesture(gesture, null, null)
+    }
+
+    private fun toResolverNode(node: AccessibilityNodeInfo): SearchTargetResolver.Node {
+        val bounds = Rect().also { node.getBoundsInScreen(it) }
+        return SearchTargetResolver.Node(
+            text = node.text?.toString().orEmpty(),
+            hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) node.hintText?.toString().orEmpty() else "",
+            description = node.contentDescription?.toString().orEmpty(),
+            resourceId = node.viewIdResourceName.orEmpty(),
+            className = node.className?.toString().orEmpty(),
+            left = bounds.left,
+            top = bounds.top,
+            right = bounds.right,
+            bottom = bounds.bottom,
+            clickable = node.isClickable,
+            editable = node.isEditable,
+            enabled = node.isEnabled,
+        )
+    }
+
+    private fun JSONObject.optNonBlank(key: String): String? =
+        optString(key, "").trim().takeIf { it.isNotEmpty() }
+}
+
+/** One-call generic app search transaction: launch → locate → edit → submit → verify. */
+class SearchInAppTool : QuroTool {
+    override val name = "search_in_app"
+    override val description = "用户要求“打开某 App 搜索联系人/商品/内容”时必须直接调用本工具。内部按顺序打开 App、识别搜索栏、确认可编辑框并输入；不要先调用 search_and_launch_app，也不要直接调用 input_text。"
+    override val parametersJson = """{
+        "type":"object",
+        "properties":{
+            "app_name":{"type":"string","description":"目标应用显示名"},
+            "query":{"type":"string","description":"要搜索的文字"}
+        },
+        "required":["app_name","query"]
+    }"""
+
+    override fun run(context: Context, arguments: String): String {
+        val args = runCatching { JSONObject(arguments) }.getOrElse { return "❌ 参数不是有效 JSON" }
+        val appName = args.optString("app_name").trim()
+        val query = args.optString("query").trim()
+        if (appName.isEmpty() || query.isEmpty()) return "❌ app_name 和 query 均不能为空"
+        val svc = QuroAccessibilityService.instance ?: return "❌ 无障碍服务未连接"
+
+        val launched = SearchAndLaunchAppTool().run(
+            context,
+            JSONObject().put("app_name", appName).toString(),
+        )
+        if (!launched.startsWith("已")) return "❌ [打开应用] $launched"
+        Thread.sleep(1200)
+
+        val activated = activateSearchFromCurrentOrAncestor(context, svc)
+        if (!activated.startsWith("✅")) return "❌ [打开搜索栏] $activated"
+
+        val inputResult = InputTextTool().run(
+            context,
+            JSONObject().put("text", query).put("hint", "搜索").toString(),
+        )
+        if (inputResult.contains("FOCUSED_PASTE_PENDING_VERIFICATION")) {
+            return "⚠️ [SEARCH_QUERY_PENDING_VISUAL_VERIFICATION] 已在$appName 激活搜索并向聚焦框输入“$query”；" +
+                "目标应用未暴露可回读节点，必须下一轮截图核对，不得直接报告完成"
+        }
+        if (!inputResult.startsWith("✅")) return "❌ [填入文字] $inputResult"
+
+        var root = ExternalUiTargetSession.rootForAutomation(svc)
+            ?: return "❌ [按搜索] 目标应用窗口已丢失"
+        val editables = collectVisibleEditables(root)
+        if (editables.isEmpty()) return "❌ [按搜索] 已输入但无法重新取得搜索编辑框"
+
+        val rankedEditors = SearchTargetResolver.rank(editables.map(::snapshotNode))
+            .filter { it.kind == SearchTargetResolver.Kind.EDITABLE_FIELD }
+        val target = when {
+            rankedEditors.isNotEmpty() -> {
+                val wanted = rankedEditors.first().node
+                editables.firstOrNull { snapshotNode(it) == wanted }
+            }
+            editables.size == 1 -> editables.single()
+            else -> null
+        } ?: return "❌ [检测输入框] 存在多个编辑框，无法可靠确定搜索框"
+
+        root = ExternalUiTargetSession.rootForAutomation(svc) ?: return "❌ [按搜索] 无法读取提交界面"
+        val submit = findSubmitNode(root)
+        val before = fingerprint(root)
+        val submitted = if (submit != null) {
+            submit.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            target.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+        } else false
+        if (!submitted) return "❌ [按搜索] 未找到搜索按钮且键盘搜索动作不可用"
+
+        repeat(8) {
+            Thread.sleep(250)
+            val after = ExternalUiTargetSession.rootForAutomation(svc) ?: return@repeat
+            if (fingerprint(after) != before) {
+                return "✅ [SEARCH_TRANSACTION_COMPLETE] 已在$appName 搜索“$query”，结果页面变化已确认"
+            }
+        }
+        return "❌ [验证结果] 已按搜索但页面没有变化，未确认任务完成"
+    }
+
+    /**
+     * App search is a top-level task, while Android commonly restores the exact previous page
+     * (for example, a chat or product detail).  If that page has no global-search entry, walk up
+     * a small number of levels.  Every Back is guarded by the remembered package before and after
+     * the action so a missing search icon can never turn into blind navigation outside the target.
+     */
+    private fun activateSearchFromCurrentOrAncestor(
+        context: Context,
+        svc: QuroAccessibilityService,
+    ): String {
+        var result = ActivateAppSearchTool().run(context, "{}")
+        if (result.startsWith("✅")) return result
+
+        val targetPackage = ExternalUiTargetSession.rememberedPackage(context)
+            ?: return result
+        val failures = mutableListOf("当前页: $result")
+        for (step in 0 until SearchPageBacktrackPolicy.MAX_BACK_STEPS) {
+            val beforePackage = svc.actionableRoot()?.packageName?.toString()
+            if (!SearchPageBacktrackPolicy.mayGoBack(step, targetPackage, beforePackage)) {
+                return "❌ 搜索页回溯前台校验失败，已停止；${failures.joinToString(" | ")}"
+            }
+            if (!svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)) {
+                return "❌ 第${step + 1}次返回动作未能派发，已停止；${failures.joinToString(" | ")}"
+            }
+
+            var afterPackage: String? = null
+            repeat(10) {
+                Thread.sleep(200)
+                afterPackage = svc.actionableRoot()?.packageName?.toString()
+                if (afterPackage != beforePackage || afterPackage == targetPackage) return@repeat
+            }
+            if (!SearchPageBacktrackPolicy.mayRetryActivation(targetPackage, afterPackage)) {
+                return "❌ 返回后已离开目标 App（${afterPackage ?: "无前台窗口"}），为防止误操作已停止"
+            }
+
+            result = ActivateAppSearchTool().run(context, "{}")
+            if (result.startsWith("✅")) {
+                return "✅ [SEARCH_ACTIVATED_AFTER_BACK] 返回 ${step + 1} 层后已确认搜索框；$result"
+            }
+            failures += "返回${step + 1}层: $result"
+        }
+        return "❌ 已在目标 App 内安全回溯 ${SearchPageBacktrackPolicy.MAX_BACK_STEPS} 层，仍未找到可验证的全局搜索入口；" +
+            failures.joinToString(" | ")
+    }
+
+    private fun collectIndexedNodes(root: AccessibilityNodeInfo): List<Pair<AccessibilityNodeInfo, SearchTargetResolver.Node>> {
+        val out = mutableListOf<Pair<AccessibilityNodeInfo, SearchTargetResolver.Node>>()
+        var visited = 0
+        fun visit(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 16 || visited++ >= 1200) return
+            if (node.isVisibleToUser) out += node to snapshotNode(node)
+            for (i in 0 until node.childCount.coerceAtMost(60)) node.getChild(i)?.let { visit(it, depth + 1) }
+        }
+        visit(root, 0)
+        return out
+    }
+
+    private fun collectVisibleEditables(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> =
+        collectIndexedNodes(root).filter { it.first.isEditable }.map { it.first }
+
+    private fun snapshotNode(node: AccessibilityNodeInfo): SearchTargetResolver.Node {
+        val b = Rect().also { node.getBoundsInScreen(it) }
+        return SearchTargetResolver.Node(
+            text = node.text?.toString().orEmpty(),
+            hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) node.hintText?.toString().orEmpty() else "",
+            description = node.contentDescription?.toString().orEmpty(),
+            resourceId = node.viewIdResourceName.orEmpty(),
+            className = node.className?.toString().orEmpty(),
+            left = b.left, top = b.top, right = b.right, bottom = b.bottom,
+            clickable = node.isClickable, editable = node.isEditable, enabled = node.isEnabled,
+        )
+    }
+
+    private fun verifyText(node: AccessibilityNodeInfo, expected: String): Boolean {
+        repeat(5) {
+            Thread.sleep(150)
+            runCatching { node.refresh() }
+            if (node.text?.toString().orEmpty() == expected) return true
+        }
+        return false
+    }
+
+    private fun findSubmitNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val candidates = mutableListOf<Pair<Int, AccessibilityNodeInfo>>()
+        fun clickable(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+            var cur: AccessibilityNodeInfo? = node
+            repeat(8) {
+                val n = cur ?: return null
+                if (n.isClickable && n.isEnabled && n.isVisibleToUser) return n
+                cur = n.parent
+            }
+            return null
+        }
+        var visited = 0
+        fun visit(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 16 || visited++ >= 1200) return
+            val label = listOf(node.text, node.contentDescription).joinToString(" ") { it?.toString().orEmpty() }
+                .lowercase().replace(Regex("[\\s_\\-.:/]+"), "")
+            if (!node.isEditable && label in setOf("搜索", "查找", "search")) {
+                clickable(node)?.let { hit ->
+                    val b = Rect().also { hit.getBoundsInScreen(it) }
+                    candidates += ((if (b.top < 500) 10_000 else 0) + b.centerX() - b.width()) to hit
+                }
+            }
+            for (i in 0 until node.childCount.coerceAtMost(60)) node.getChild(i)?.let { visit(it, depth + 1) }
+        }
+        visit(root, 0)
+        return candidates.maxByOrNull { it.first }?.second
+    }
+
+    private fun dispatchTap(svc: QuroAccessibilityService, x: Float, y: Float): Boolean {
+        val path = Path().apply { moveTo(x, y) }
+        val gesture = android.accessibilityservice.GestureDescription.Builder()
+            .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(path, 0L, 80L))
+            .build()
+        return svc.dispatchGesture(gesture, null, null)
+    }
+
+    private fun fingerprint(root: AccessibilityNodeInfo): String = collectIndexedNodes(root)
+        .take(120)
+        .joinToString("\n") { (_, n) -> "${n.text}|${n.description}|${n.resourceId}|${n.left},${n.top},${n.right},${n.bottom}" }
+}
+
+internal object SearchPageBacktrackPolicy {
+    const val MAX_BACK_STEPS = 3
+
+    fun mayGoBack(step: Int, targetPackage: String, foregroundPackage: String?): Boolean =
+        step in 0 until MAX_BACK_STEPS && targetPackage.isNotBlank() && foregroundPackage == targetPackage
+
+    fun mayRetryActivation(targetPackage: String, foregroundPackage: String?): Boolean =
+        targetPackage.isNotBlank() && foregroundPackage == targetPackage
 }
 
 /** 滚动列表（向前/向后）。 */
@@ -580,7 +1285,7 @@ class ScrollScreenTool : QuroTool {
         val svc = QuroAccessibilityService.instance ?: return "❌ 无障碍服务未连接"
         val args = JSONObject(arguments)
         return try {
-            val root = svc.rootInActiveWindow ?: return "⚠️ 无法获取窗口根节点"
+            val root = svc.actionableRoot() ?: return "⚠️ 无法获取窗口根节点"
             val dir = args.optString("direction", "forward")
             val count = args.optInt("count", 3).coerceIn(1, 20)
             val action = when (dir) {

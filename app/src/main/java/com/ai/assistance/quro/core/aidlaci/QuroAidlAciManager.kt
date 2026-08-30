@@ -164,7 +164,21 @@ class QuroAidlAciManager private constructor(private val appContext: Context) {
         className: String,
         latch: java.util.concurrent.CountDownLatch? = null
     ): Boolean {
-        val intent = Intent(ACI_ACTION).apply { setClassName(packageName, className) }
+        // The controlled app can rename its exported ACI service during an in-place update.
+        // Never retry a stale in-memory ComponentName forever: resolve ACTION_BIND immediately
+        // before every bind and refresh classMap when the installed manifest changed.
+        val resolvedClass = appContext.packageManager
+            .queryIntentServices(Intent(ACI_ACTION).setPackage(packageName), PackageManager.GET_META_DATA)
+            .firstOrNull { it.serviceInfo?.packageName == packageName }
+            ?.serviceInfo
+            ?.name
+            .orEmpty()
+            .ifBlank { className }
+        if (resolvedClass != className) {
+            classMap[packageName] = resolvedClass
+            AciDiag.log(TAG, "doBind: refreshed stale component $packageName/$className -> $resolvedClass")
+        }
+        val intent = Intent(ACI_ACTION).apply { setClassName(packageName, resolvedClass) }
         val conn = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
                 // 双契约兼容：新契约（ai.aidl.aci.core）优先，旧契约（ai.aci.core，浏览器等旧受控端）兜底。
@@ -709,6 +723,9 @@ class QuroAidlAciManager private constructor(private val appContext: Context) {
     // ═══════════════════════════════════
     fun getCapabilityIndex(): Map<String, List<Capability>> = HashMap(capMap)
 
+    /** Snapshot used by the task router; callers cannot mutate the live discovery maps. */
+    fun getDiscoveredAppNames(): Map<String, String> = HashMap(nameMap)
+
     /** 返回某包协商后的 ACI 协议版本（未协商返回 null）。 */
     fun getNegotiatedProtocol(packageName: String): String? = protocolMap[packageName]
 
@@ -731,13 +748,14 @@ class QuroAidlAciManager private constructor(private val appContext: Context) {
     /**
      * 生成可直接拼进 LLM System Prompt 的能力清单（仿 ACIManager.getCapabilityPrompt）。
      */
-    fun getCapabilityPrompt(): String {
+    fun getCapabilityPrompt(allowedPackages: Set<String>? = null): String {
         val sb = StringBuilder()
         sb.append("你当前可以通过 ACI 控制第三方 App 的能力如下（用 aci_call 调用）。ACI 是本地无 Root 的 App 间 AIDL 框架，不依赖 Shizuku/dumpsys/ROOT 等任何系统提权：\n\n")
         if (capMap.isEmpty()) {
             sb.append("（尚未发现任何 ACI 能力。应用启动时会自动 discover；若已装第三方 ACI App 仍未出现，可重试或确认其已安装。）\n")
         } else {
             for ((pkg, caps) in capMap) {
+                if (allowedPackages != null && pkg !in allowedPackages) continue
                 val appName = nameMap[pkg] ?: pkg
                 sb.append("【").append(appName).append("】(").append(pkg).append(")\n")
                 for (c in caps) {
@@ -754,7 +772,7 @@ class QuroAidlAciManager private constructor(private val appContext: Context) {
         
         // 添加 MCP 桥接能力
         val mcpPrompt = McpAciBridge.getMcpCapabilityPrompt()
-        if (mcpPrompt.isNotEmpty()) {
+        if (allowedPackages == null && mcpPrompt.isNotEmpty()) {
             sb.append("\n").append(mcpPrompt)
         }
         

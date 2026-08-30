@@ -1980,16 +1980,17 @@ $recent
             "- 多个相互独立动作可在同一轮并行发起多个 tool_calls。\n"
         )
         sb.append("\n### 常驻工具（每轮已下发，可直接调用，无需先查）\n")
-        sb.append("以下工具高频常用，已直接可用；其余全部工具请先经 `tool_router` 加载：\n")
-        QuroToolRouter.ALWAYS_ON.forEach { name ->
-            specs.firstOrNull { it.name == name }?.let { s ->
-                sb.append("- ${s.name}：${s.description}\n")
-            }
-        }
+        val activeNames = QuroToolRouter.ALWAYS_ON.filter { name -> specs.any { it.name == name } }
+        sb.append(activeNames.joinToString(", ")).append("\n")
+        sb.append("这些工具的完整说明和参数已经在 API tools 字段中，不在系统提示里重复。手机操作优先按“读屏/定向查找→操作→回读验证”执行；查找为空或置信度低时立即使用截图视觉。\n")
+        // Progressive disclosure removes the verbose per-tool menu, but transaction safety rules
+        // are not optional schema prose. Keep the compact directive in every mode so a messaging
+        // task cannot be mistaken for a terminal search task.
+        sb.append(com.ai.assistance.quro.core.tools.QuroToolUsageHints.buildToolUseDirective())
         sb.append("\n### 工具路由（tool_router，强制）\n")
         sb.append(
             "需要**不在上方常驻清单里**的工具时，**必须**先调 `tool_router`（禁止瞎猜工具名）：\n" +
-            "- `tool_router(action=\"match_intent\", intent=\"用户需求描述\")` → 按意图推荐匹配工具\n" +
+            "- `tool_router(action=\"match_intent\", intent=\"用户需求描述\")` → 推荐并自动加载最相关工具，下一轮可直接调用\n" +
             "- `tool_router(action=\"get_schema\", name=\"工具名\")` → 返回该工具【完整参数 + 专属使用提示词】，并加载它（下一轮起即可直接调用）\n" +
             "- `tool_router(action=\"list_categories\")` / `list_tools(category=...)` 浏览全部分类\n" +
             "**正确做法**：遇到任何不确定，先 `tool_router` 检索，看清参数与用法再调用。\n"

@@ -8,7 +8,10 @@ import com.ai.assistance.quro.core.QuroToolResult
 import com.ai.assistance.quro.core.QuroToolSpec
 import com.ai.assistance.quro.core.mcp.DroidMcp
 import com.ai.assistance.quro.core.mcp.McpTool
+import com.ai.assistance.quro.service.QuroAccessibilityService
+import com.ai.assistance.quro.util.QuroDiag
 import kotlinx.coroutines.delay
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 工具接口：名称 + 描述 + 参数 JSON-Schema + 执行。
@@ -164,7 +167,10 @@ class QuroToolRegistry {
             "workspace_write", "workspace_read", "workspace_list",
             // L1 无障碍控屏（CapOS 通道）
             "read_screen", "get_foreground_app", "get_screen_state",
-            "tap_screen", "swipe_screen", "input_text", "scroll_screen", "global_action",
+            "tap_screen", "swipe_screen", "input_text", "search_in_app", "activate_app_search", "paste_focused_text", "send_message_in_app", "scroll_screen", "global_action",
+            // 自绘/WebView App 的输入回读必须让模型真正看到截图；只在 router
+            // ALWAYS_ON 中声明而不进入 coreSpecs 会让工具实际从 API schema 消失。
+            "screenshot", "visual_analysis",
             // AI 智能体键盘（Agent IME）：把文本直接打字进聚焦输入框（需启用并切到『Zorv AI 键盘』）
             "ai_type_text", "ai_press_enter", "ai_press_send",
             // 媒体：百分百开源本地音乐 / 视频播放器（后台可用，对话框显示播放卡片）
@@ -230,7 +236,14 @@ class QuroToolRegistry {
  * 两个引擎共用同一份 QuroTool 原创真相源，工具实现零复制。
  */
 class QuroToolEngine(private val registry: QuroToolRegistry) {
+    companion object {
+        private val executionRound = AtomicLong(0)
+    }
+
     private var appContext: Context? = null
+    private var consecutiveReadScreenCalls = 0
+    private var lastTapSignature: String? = null
+    private var lastSuccessfulInputSignature: String? = null
 
     private val droidMcp: DroidMcp = DroidMcp.builder()
         .addTools(registry.all().map { it.toMcpTool(this) })
@@ -247,12 +260,13 @@ class QuroToolEngine(private val registry: QuroToolRegistry) {
     /** 按 LLM 返回的 tool_calls 逐一执行（经 droid-mcp 引擎派发）。 */
     suspend fun execute(context: Context, calls: List<QuroToolCall>): List<QuroToolResult> {
         appContext = context
-        return calls.map { call ->
+        val round = executionRound.incrementAndGet()
+        return calls.mapIndexed { callIndex, call ->
             // ══ 技能工具分支（skill__<技能名>）：直接读实时技能指令回灌，复用 tool 结果管道 ══
             if (call.name.startsWith("skill__")) {
                 val skillName = call.name.removePrefix("skill__")
                 val skill = QuroSkillStore.load(context).firstOrNull { it.name == skillName && it.enabled }
-                    ?: return@map QuroToolResult(call.name, "技能「$skillName」未启用或不存在")
+                    ?: return@mapIndexed tracedResult(context, round, callIndex, call, "技能「$skillName」未启用或不存在")
                 val userInput = runCatching { JSONObject(call.arguments) }.getOrElse { JSONObject() }
                     .optString("input", "").trim()
                 val directive = buildString {
@@ -260,11 +274,52 @@ class QuroToolEngine(private val registry: QuroToolRegistry) {
                     appendLine(skill.prompt)
                     if (userInput.isNotBlank()) appendLine("\n用户本轮输入：$userInput")
                 }
-                return@map QuroToolResult(call.name, directive)
+                return@mapIndexed tracedResult(context, round, callIndex, call, directive)
             }
             val tool = registry.get(call.name)
             if (tool == null) {
-                return@map QuroToolResult(call.name, "未知工具: ${call.name}")
+                return@mapIndexed tracedResult(context, round, callIndex, call, "未知工具: ${call.name}")
+            }
+            if (call.name == "read_screen") {
+                consecutiveReadScreenCalls++
+                if (consecutiveReadScreenCalls > 2) {
+                    return@mapIndexed tracedResult(
+                        context, round, callIndex, call,
+                        "❌ 已阻止同一页面连续 read_screen。必须改用 find_ui_element(query=\"搜索\")；若无候选，只调用一次 visual_analysis。",
+                    )
+                }
+            } else if (call.name in setOf(
+                    "tap_screen", "swipe_screen", "long_press_screen", "scroll_screen",
+                    "input_text", "search_in_app", "activate_app_search", "paste_focused_text", "send_message_in_app", "global_action", "launch_app", "search_and_launch_app", "visual_analysis",
+                )) {
+                consecutiveReadScreenCalls = 0
+            }
+            if (call.name == "tap_screen") {
+                val signature = runCatching {
+                    val tap = JSONObject(call.arguments)
+                    if (tap.has("x") && tap.has("y")) "${tap.optDouble("x")},${tap.optDouble("y")}" else null
+                }.getOrNull()
+                if (signature != null && signature == lastTapSignature) {
+                    return@mapIndexed tracedResult(
+                        context, round, callIndex, call,
+                        "❌ 已阻止重复点击同一坐标；上一点击没有带来可用输入框。请重新检查截图并选择不同的真实控件坐标。",
+                    )
+                }
+                lastTapSignature = signature
+            } else if (call.name in setOf("swipe_screen", "global_action", "launch_app", "search_and_launch_app")) {
+                lastTapSignature = null
+                lastSuccessfulInputSignature = null
+            }
+            if (call.name == "input_text") {
+                val signature = runCatching {
+                    JSONObject(call.arguments).optString("text", "").trim()
+                }.getOrDefault(call.arguments.trim())
+                if (signature == lastSuccessfulInputSignature) {
+                    return@mapIndexed tracedResult(
+                        context, round, callIndex, call,
+                        "❌ 已阻止在同一界面重复输入相同文字；输入已在上一轮确认。禁止再次调用 input_text，请继续点击提交/搜索。",
+                    )
+                }
             }
             // 危险权限前置申请：工具运行在 Application Context 上无法弹框，交由 Activity 注入的网关处理。
             val perms = tool.requiredPermissions
@@ -276,16 +331,16 @@ class QuroToolEngine(private val registry: QuroToolRegistry) {
                     // 🔧 #766 修复：对话框成功后系统已授权，但 ensure 的 continuation 可能因 Activity 失焦/
                     //   重建而返回 false；此时以系统真实状态二次核验，已授权即放行，不再误拒。
                     if (!QuroPermissionHolder.isGranted(context, perms)) {
-                        return@map QuroToolResult(
-                            call.name,
+                        return@mapIndexed tracedResult(
+                            context, round, callIndex, call,
                             "需要权限：${perms.joinToString()}，请在系统设置或弹出的对话框中授予后重试。",
                         )
                     }
                 } else {
                     // 没有可拉起对话框的网关（如工具在后台/非 Activity 场景执行）：
                     // 系统未授予且无法自动补全授权，明确返回需要权限。
-                    return@map QuroToolResult(
-                        call.name,
+                    return@mapIndexed tracedResult(
+                        context, round, callIndex, call,
                         "需要权限：${perms.joinToString()}，请在「设置 → 权限」中授予后重试。",
                     )
                 }
@@ -302,8 +357,60 @@ class QuroToolEngine(private val registry: QuroToolRegistry) {
             } else {
                 "工具执行失败: ${res.errorMessage}"
             }
-            QuroToolResult(call.name, text)
+            if (call.name == "input_text" && text.startsWith("✅")) {
+                lastSuccessfulInputSignature = runCatching {
+                    JSONObject(call.arguments).optString("text", "").trim()
+                }.getOrDefault(call.arguments.trim())
+            }
+            tracedResult(context, round, callIndex, call, text)
         }
+    }
+
+    private fun tracedResult(
+        context: Context,
+        round: Long,
+        callIndex: Int,
+        call: QuroToolCall,
+        text: String,
+    ): QuroToolResult {
+        val status = when {
+            text.startsWith("❌") || text.startsWith("工具执行失败") || text.startsWith("未知工具") -> "failure"
+            text.startsWith("⚠") || text.startsWith("需要权限") -> "warning"
+            else -> "success"
+        }
+        val foregroundPackage = runCatching {
+            QuroAccessibilityService.instance?.actionableRoot()?.packageName?.toString()
+        }.getOrNull().orEmpty().ifBlank { "unknown" }
+        QuroDiag.log(
+            "TOOL_TRACE",
+            "round=$round call=${callIndex + 1} tool=${call.name.take(80)} " +
+                "args=${sanitizeArguments(call.arguments)} status=$status resultLength=${text.length} " +
+                "foregroundPackage=${foregroundPackage.take(120)}",
+        )
+        return QuroToolResult(call.name, text)
+    }
+
+    private fun sanitizeArguments(arguments: String): String {
+        val json = runCatching { JSONObject(arguments) }.getOrNull()
+            ?: return "invalid_json(length=${arguments.length})"
+        val parts = mutableListOf<String>()
+        val keys = json.keys()
+        while (keys.hasNext() && parts.size < 20) {
+            val key = keys.next()
+            val lower = key.lowercase()
+            val value = json.opt(key)
+            val rendered = when {
+                listOf("token", "secret", "password", "authorization", "apikey", "api_key", "base64", "screenshot")
+                    .any { lower.contains(it) } -> "[redacted]"
+                lower in setOf("text", "input", "content", "query", "hint", "target_text", "target_desc") ->
+                    "length=${value?.toString()?.length ?: 0}"
+                value == null || value == JSONObject.NULL -> "null"
+                value is Number || value is Boolean -> value.toString()
+                else -> value.toString().replace("\n", " ").replace("\r", " ").take(80)
+            }
+            parts += "$key=$rendered"
+        }
+        return "{${parts.joinToString(",")}}"
     }
 
     /** 导出 MCP 格式工具清单（供协议/桌面客户端）。 */

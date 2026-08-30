@@ -94,7 +94,9 @@ object QuroOnDeviceAsr {
 
     /** 是否已部署可用模型（三件套齐全）。 */
     fun isModelAvailable(ctx: Context): Boolean =
-        QuroOnDeviceModelManager.getDeployedModelFiles(ctx.applicationContext) != null
+        QuroOnDeviceModelManager.verifyDeployedDir(
+            QuroOnDeviceModelPrefs.getDeployedDir(ctx.applicationContext)
+        )
 
     fun isReady(): Boolean = ready && bound
 
@@ -137,7 +139,10 @@ object QuroOnDeviceAsr {
         }
         val layout = detectAsrLayout(File(dir))
         when (layout) {
-            AsrModelLayout.TRANSDUCER -> { /* 布局合法，继续加载 */ }
+            AsrModelLayout.TRANSDUCER,
+            AsrModelLayout.ONNX_SENSE_VOICE,
+            AsrModelLayout.ONNX_STREAMING_PARAFORMER,
+            AsrModelLayout.ONNX_QWEN3_ASR -> { /* 布局合法，继续加载 */ }
             AsrModelLayout.ONNX_LEGACY ->
                 // 旧 ONNX 部署目录与 NCNN 引擎不兼容：拒绝加载（保留部署记录，待用户重新下载）
                 return fail("已部署的是 ONNX 格式模型，与本机 NCNN 引擎不兼容。请删除后重新下载推荐的流式模型。")
@@ -153,7 +158,13 @@ object QuroOnDeviceAsr {
         val result = CompletableDeferred<LoadReply>()
         val msg = Message.obtain(null, QuroAsrService.MSG_LOAD)
         msg.data.putString(QuroAsrService.KEY_DIR, dir)
-        msg.data.putString(QuroAsrService.KEY_TYPE, AsrModelType.STREAMING_TRANSDUCER.name)
+        val storedType = QuroOnDeviceModelPrefs.getDeployedType(appCtx)
+        val inferredType = when (layout) {
+            AsrModelLayout.ONNX_SENSE_VOICE -> AsrModelType.ONNX_SENSE_VOICE
+            AsrModelLayout.ONNX_STREAMING_PARAFORMER -> AsrModelType.ONNX_STREAMING_PARAFORMER
+            else -> AsrModelType.STREAMING_TRANSDUCER
+        }
+        msg.data.putString(QuroAsrService.KEY_TYPE, storedType ?: inferredType.name)
         msg.data.putInt(QuroAsrService.KEY_THREADS, recommendedThreads())
         msg.replyTo = Messenger(LoadReplyHandler(result))
         return try {

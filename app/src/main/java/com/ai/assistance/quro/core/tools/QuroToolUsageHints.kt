@@ -34,7 +34,11 @@ object QuroToolUsageHints {
         // ── 应用管理 ──
         "list_installed_apps" to "「我装了哪些 App」「列一下应用」「有没有装 XX」都调用",
         "launch_app" to "「打开微信」「启动相机」「帮我开 XX 应用」都调用",
-        "search_and_launch_app" to "「打开那个绿的聊天软件」「找一下能扫码的 App 打开」「名字里有'shop'的打开」都调用",
+        "search_and_launch_app" to "只负责从已安装应用列表按名称找 App 并打开；不搜索 App 内的联系人、商品或内容",
+        "search_in_app" to "「去某 App 搜索/找某物」优先调用；内部通用支持无障碍搜索入口和截图放大镜。自绘 App 返回待视觉核验时，下一轮必须截图确认",
+        "activate_app_search" to "当前页面需要打开顶部全局搜索时调用；节点优先，空树才本地识别放大镜，明确排除加号，多候选或激活未验证即停止",
+        "paste_focused_text" to "自绘 App 无 EditText、但搜索框或消息框已聚焦且键盘已出现时输入中文；返回待核验后必须截图回读",
+        "send_message_in_app" to "「在某聊天 App 搜索联系人并发送文字」优先走此通用事务；自绘 App 返回 needs_visual 时必须原样回传 transaction_id 和 stage，按附图 instruction 逐轮核对。仅当当前用户明确给出应用、联系人、正文并要求立即发送时 confirm_send=true",
         "get_package_name" to "「XX 应用的包名是什么」「这个 App 的 package」都调用",
         "list_app_functions" to "「这个 App 能做什么」「XX 有哪些可调用功能」「能调起它的什么页面」都调用",
         "invoke_app_function" to "「用 XX App 分享到朋友圈」「调起 XX 的扫一扫」「让 XX 打开某页面」都调用",
@@ -79,7 +83,7 @@ object QuroToolUsageHints {
 
         // ── 网络 / Web ──
         "http_request" to "「调一下这个接口」「发个 GET/POST 到 XX」「请求这个 URL」「对接某个 API」都调用",
-        "open_web" to "「打开百度」「访问 XX 网址」类请求：若系统提示里已声明【默认 ACI 应用已设置】（通常是受控浏览器），【优先用 aci_call 的 browser_open】（真实可交互、能点进去）；只有在未设默认 ACI 应用时才用 open_web 被动展示（仅供查看，AI 无法点击交互）。真正操作网页（点链接/填表/翻页）一律用 aci_call 的 browser_open→browser_elements→browser_action。",
+        "open_web" to "「打开百度」「访问 XX 网址」类请求：若任务路由器已提供浏览器 aci_call，则显式传入其 target_package 调 browser_open；否则用 open_web 被动展示。普通原生 App 任务不得调用浏览器 ACI。",
         "ai_browser" to "多用途：既能「后台联网搜索资料/自动研究」也能「打开网页被动展示」也能「下载网页里的文件」——需要 AI 自动上网查资料/下载时调用（open 仅展示、不能点击；真正点击/填表/进入子页面请用 aci_call 的 ZorvAI 受控浏览器 browser_open→browser_elements→browser_action）",
 
         // ── 代码执行 ──
@@ -160,12 +164,16 @@ object QuroToolUsageHints {
 
         // ── L1 无障碍控屏 ──
         "read_screen" to "「看看现在屏幕上是啥」「读一下当前界面」「这个 App 现在显示啥」都调用",
+        "find_ui_element" to "局部查找控件；App 内搜索统一用 query=\"搜索\"，返回结果会区分搜索入口与可编辑搜索框",
         "get_foreground_app" to "「我现在在前用哪个 App」「前台是哪个」都调用",
         "get_screen_state" to "「屏幕亮着吗」「锁屏没」「是否熄屏」都调用",
         "tap_screen" to "「点一下屏幕上的 XX 按钮」「帮我戳那个位置」都调用",
         "long_press_screen" to "「长按 XX 弹出菜单」「长按选择这段文字」「长按应用图标卸载」都调用（触发长按菜单/选择/拖拽预备）",
         "swipe_screen" to "「往上滑」「左滑翻页」「划一下」「在 (x1,y1)→(x2,y2) 划」都调用",
         "input_text" to "「在那个输入框里打'你好'」「填表」都调用",
+        "activate_app_search" to "激活聊天 App 首页顶部全局搜索；不处理商品页、图片缩放或页面内查找",
+        "paste_focused_text" to "自绘输入框的 Unicode 粘贴兜底；派发后必须视觉回读，不能直接报告输入成功",
+        "send_message_in_app" to "跨应用聊天统一事务：搜索并唯一匹配联系人、核对会话标题、输入回读；没有当前明确发送授权时只保留草稿",
         "scroll_screen" to "「往下滚」「滚动列表」都调用",
         "global_action" to "「返回桌面」「下拉通知栏」「展开通知」「下拉状态栏/快捷设置」「截个图」「最近任务」「锁屏」等系统全局动作都调用",
 
@@ -238,6 +246,9 @@ object QuroToolUsageHints {
 - 动手前先想：要达成目标需走哪些步骤？哪些步骤可用工具？该用哪个（或哪几个）工具、以什么顺序、**如何配合**？
 - 多个独立动作可一次性并行发起（一次返回多个 tool_calls）；有依赖关系的动作则按顺序逐步调用。
 - 复杂任务拆成多步：思考 → 调用 → 看结果 → 再思考 → 再调用，直到任务完成。
+- App 内搜索优先一次调用 search_in_app；手工分步时必须逐轮执行并看结果：打开 App → activate_app_search → input_text（自绘 App 会安全转 paste_focused_text）→ 截图核验。前一步未确认前，禁止在同一批 tool_calls 中预先下发后续点击或输入。
+- 涉及文字输入的任务，只有 input_text 明确返回“✅ 已输入并回读确认”才算输入完成；截图已捕获、动作已派发、找到候选或 input_text 失败都不等于输入成功，不得据此报告任务完成。
+- 聊天发送必须优先调用 send_message_in_app。只有 `[MESSAGE_SEND_CONFIRMED]` 才能报告已发送；自绘页面返回 `workflow=message_send,status=needs_visual` 时，必须原样回传 transaction_id、stage，并严格按附图 instruction 继续同一工具事务。`MESSAGE_DRAFT_VERIFIED` 表示仅保存草稿，`MESSAGE_SEND_PENDING_VERIFICATION` 绝不等于成功。联系人不唯一、会话标题不符、正文未回读时立即停止。
 
 ## 3. 失败不是终点（诊断 → 解决 → 重试）
 - 工具返回失败时，**先认真读错误信息**：报了什么？是参数不对、权限不足、网络问题，还是目标不存在？

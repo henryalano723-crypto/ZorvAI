@@ -11,6 +11,7 @@ import com.ai.assistance.quro.core.QuroChatMessage
 import com.ai.assistance.quro.core.QuroLlmResult
 import com.ai.assistance.quro.core.QuroToolCall
 import com.ai.assistance.quro.core.QuroToolSpec
+import com.ai.assistance.quro.core.estimateLlmTokens
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -49,6 +50,60 @@ private const val MAX_OUTPUT_TOKENS = 131_072
  * （v455 起不再用 withTimeout：阻塞式 execute() 无法被协程超时及时取消，改为计时器 + call.cancel()。）
  */
 private const val NET_CALL_TIMEOUT_MS = 90_000L
+
+/** 429 必须遵守服务端等待时间；无法解析时保守等待 10 秒，避免失败请求继续叠加 TPM。 */
+internal fun retryDelayMillis(code: Int, retryAfter: String?, responseText: String, attempt: Int): Long {
+    if (code != 429) return 800L * attempt.coerceAtLeast(1)
+    val headerSeconds = retryAfter?.trim()?.toDoubleOrNull()
+    val bodySeconds = Regex("(?i)(?:try again|retry)[^0-9]{0,20}([0-9]+(?:\\.[0-9]+)?)\\s*s")
+        .find(responseText)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+    val seconds = listOfNotNull(headerSeconds, bodySeconds).maxOrNull() ?: 10.0
+    return (seconds * 1000.0).toLong().coerceIn(1_000L, 60_000L) + 250L
+}
+
+/**
+ * 请求发送前按结构记录占比。日志只含长度/估算值，不含正文、工具参数或密钥。
+ * `QuroTokenBudget` 可由 ADB 单独抓取，真机复测时直接判断系统、历史、工具 Schema、视觉谁占大头。
+ */
+private fun logRequestBudget(
+    messages: List<Pair<QuroChatMessage, JSONObject>>,
+    tools: List<JSONObject>,
+    body: String,
+    maxTokens: Int,
+): Int {
+    var system = 0
+    var conversation = 0
+    var toolHistory = 0
+    var visual = 0
+    var accountedChars = 0
+    messages.forEach { (message, json) ->
+        val serialized = json.toString()
+        accountedChars += serialized.length
+        val tokens = estimateLlmTokens(serialized)
+        when {
+            message.attachments.orEmpty().any { it.type == "image" } -> visual += tokens
+            message.role == "system" -> system += tokens
+            message.role == "tool" || !message.toolCalls.isNullOrEmpty() -> toolHistory += tokens
+            else -> conversation += tokens
+        }
+    }
+    val toolSchemas = tools.sumOf { json ->
+        val serialized = json.toString()
+        accountedChars += serialized.length
+        estimateLlmTokens(serialized)
+    }
+    val envelopeChars = (body.length - accountedChars).coerceAtLeast(0)
+    val envelope = (envelopeChars + 3) / 4
+    val estimatedInput = system + conversation + toolHistory + visual + toolSchemas + envelope
+    val estimatedTpmCharge = maxOf(estimatedInput, maxTokens)
+    Log.i(
+        "QuroTokenBudget",
+        "REQUEST_BUDGET input_est=$estimatedInput tpm_est=$estimatedTpmCharge " +
+            "system=$system conversation=$conversation tool_history=$toolHistory visual=$visual " +
+            "tool_schemas=$toolSchemas envelope=$envelope tools=${tools.size} messages=${messages.size} body_chars=${body.length}",
+    )
+    return estimatedTpmCharge
+}
 
 /**
  * Quro LLM 客户端（原创）：对接 OpenAI 兼容的 /chat/completions，
@@ -111,6 +166,18 @@ class QuroLlmClient(
         if (effectiveMaxTokens != maxTokens) {
             Log.w(TAG, ">>> max_tokens 被钳到 $effectiveMaxTokens（原 $maxTokens 超模型输出上限 $MAX_OUTPUT_TOKENS）")
         }
+        val serializedMessages = messages.map { m -> m to messageToJson(m, emitReasoning = !isReasoningModel) }
+        val messagesJson = JSONArray().also { arr -> serializedMessages.forEach { (_, json) -> arr.put(json) } }
+        val serializedTools = tools.map { t ->
+            JSONObject().put("type", "function").put(
+                "function",
+                JSONObject()
+                    .put("name", t.name)
+                    .put("description", t.description)
+                    .put("parameters", JSONObject(t.parametersJson)),
+            )
+        }
+        val toolsJson = if (serializedTools.isEmpty()) null else JSONArray().also { arr -> serializedTools.forEach(arr::put) }
         val body = JSONObject().apply {
             put("model", model)
             if (isReasoningModel) {
@@ -120,28 +187,15 @@ class QuroLlmClient(
                 put("temperature", temperature)
                 put("max_tokens", effectiveMaxTokens)
             }
-            put("messages", JSONArray().also { arr ->
-                messages.forEach { m -> arr.put(messageToJson(m, emitReasoning = !isReasoningModel)) }
-            })
-            if (tools.isNotEmpty()) {
-                put("tools", JSONArray().also { arr ->
-                    tools.forEach { t ->
-                        arr.put(
-                            JSONObject().put("type", "function").put(
-                                "function",
-                                JSONObject()
-                                    .put("name", t.name)
-                                    .put("description", t.description)
-                                    .put("parameters", JSONObject(t.parametersJson)),
-                            ),
-                        )
-                    }
-                })
+            put("messages", messagesJson)
+            if (toolsJson != null) {
+                put("tools", toolsJson)
                 put("tool_choice", "auto")
             }
             if (stream) put("stream", true)
         }
         val bodyStr = body.toString()
+        val estimatedTpmCharge = logRequestBudget(serializedMessages, serializedTools, bodyStr, effectiveMaxTokens)
         // ===== 调试日志：请求体概览（Logcat tag=QuroLlm）=====
         Log.i(TAG, ">>> REQUEST  model=$model url=$url messages=${messages.size} tools=${tools.size} maxTokens=$effectiveMaxTokens body=${bodyStr.length}ch")
         if (tools.isNotEmpty()) {
@@ -155,7 +209,7 @@ class QuroLlmClient(
             .build()
         // 流式路径：逐字回调，不走重试（避免半截 token 后重试造成内容错乱）。
         if (stream && onToken != null) {
-            return streamChat(req, bodyStr, onToken, onThinking)
+            return streamChat(req, bodyStr, url, model, estimatedTpmCharge, onToken, onThinking)
         }
         // 重试策略：网关类临时故障（5xx / 429）与网络异常（超时/连接失败）自动重试，
         // 避免 openresty 等反向代理偶发 502/503 直接把原始错误甩给用户。
@@ -163,12 +217,15 @@ class QuroLlmClient(
         val maxRetries = 2
         val retryableCodes = setOf(429, 500, 502, 503, 504)
         var lastErr: String? = null
+        var nextRetryDelayMs = 0L
         for (attempt in 0..maxRetries) {
             if (attempt > 0) {
-                val backoff = 800L * attempt
+                val backoff = nextRetryDelayMs.takeIf { it > 0L } ?: (800L * attempt)
+                nextRetryDelayMs = 0L
                 Log.w(TAG, "<<< RETRY attempt=$attempt/${maxRetries} after ${backoff}ms (prev=${lastErr ?: "n/a"})")
                 delay(backoff)
             }
+            QuroTpmGate.acquire(url, model, estimatedTpmCharge)
             // 🔧 Bug修复「取消被当成错误展示」：OkHttp execute() 是阻塞调用，协程取消本身打不断它。
             //   这里注册两个钩子：
             //   ① cancelHook：协程被取消（用户停止/切会话）→ 立即 call.cancel() 中止阻塞读写；
@@ -190,6 +247,7 @@ class QuroLlmClient(
             }
             try {
                 val callResult = call.execute().use { resp ->
+                    QuroTpmGate.observeResponse(url, model, resp.header("x-ratelimit-limit-tokens"))
                     val rawBody = resp.body?.string().orEmpty()
                     // 🛡️ 响应体超限截断：MiMo 等推理模型可能返回数 MB 的 reasoning_content，
                     // org.json 递归解析时 StackOverflowError → "stack size 8188KB"。
@@ -205,7 +263,12 @@ class QuroLlmClient(
                     Log.i(TAG, "<<< RESPONSE HTTP=${resp.code} body=${text.length}ch preview=$preview")
                     if (!resp.isSuccessful) {
                         lastErr = "HTTP ${resp.code}"
-                        if (resp.code in retryableCodes && attempt < maxRetries) {
+                        // 429 失败请求本身也会消耗 TPM：只允许一次、且严格等待服务端 Retry-After，
+                        // 禁止旧版 0.8/1.6 秒快速重发同一份大请求继续放大限流。
+                        val mayRetry = resp.code in retryableCodes && attempt < maxRetries && !(resp.code == 429 && attempt >= 1)
+                        if (mayRetry) {
+                            nextRetryDelayMs = retryDelayMillis(resp.code, resp.header("Retry-After"), text, attempt + 1)
+                            if (resp.code == 429) QuroTpmGate.observe429(url, model, text, nextRetryDelayMs)
                             return@use null // 临时故障 → 进入下一次重试
                         }
                         // 🔧 把真实发出的请求体 + 上游响应双写到 Download/QuroAI_logs/，
@@ -685,7 +748,15 @@ class QuroLlmClient(
      *    这与非流式 chat() 的重试策略对齐，也对齐「其他客户端连得上」的体感——
      *    单次建连因路由/解析抖动失败不该直接判死，给一次重连机会；已吐出内容则不重试（避免错乱）。
      */
-    private suspend fun streamChat(req: Request, requestBody: String, onToken: (String) -> Unit, onThinking: ((String) -> Unit)? = null): QuroLlmResult {
+    private suspend fun streamChat(
+        req: Request,
+        requestBody: String,
+        url: String,
+        model: String,
+        estimatedTpmCharge: Int,
+        onToken: (String) -> Unit,
+        onThinking: ((String) -> Unit)? = null,
+    ): QuroLlmResult {
         val contentAcc = StringBuilder()
         val reasoningAcc = StringBuilder()
         // 🔧 v291 修复：流式响应里模型返回的 tool_calls 也以 delta 形式下发，必须按 index 累计
@@ -699,6 +770,7 @@ class QuroLlmClient(
         val maxRetries = 2
         val retryableCodes = setOf(429, 500, 502, 503, 504)
         var lastErr: Exception? = null
+        var nextRetryDelayMs = 0L
         for (attempt in 0..maxRetries) {
             // 🔧 toolfix9：首 token 前可重试的 HTTP 状态码（5xx/429）命中时置此，循环外进入下一轮重试。
             //   在循环内声明 → 每轮重置，避免上一轮置位污染本轮成功结果导致误重试。
@@ -706,9 +778,12 @@ class QuroLlmClient(
             if (attempt > 0) {
                 // 已吐出内容 → 不再重试，按已有内容兜底（下方统一处理）。
                 if (contentAcc.isNotEmpty() || toolAcc.isNotEmpty()) break
-                Log.w(TAG, "<<< STREAM RETRY attempt=$attempt/$maxRetries (prev=${lastErr?.message})")
-                delay(800L * attempt)
+                val backoff = nextRetryDelayMs.takeIf { it > 0L } ?: (800L * attempt)
+                nextRetryDelayMs = 0L
+                Log.w(TAG, "<<< STREAM RETRY attempt=$attempt/$maxRetries after ${backoff}ms (prev=${lastErr?.message})")
+                delay(backoff)
             }
+            QuroTpmGate.acquire(url, model, estimatedTpmCharge)
             try {
                 // 🔧 Bug修复「取消被当成错误展示」：execute()/readUtf8Line() 均为阻塞调用，
                 //   协程取消打不断它们（长思考无 SSE 行时，取消最长要等 readTimeout=120s 才生效，
@@ -720,6 +795,7 @@ class QuroLlmClient(
                 }
                 val result = try {
                     call.execute().use { resp ->
+                    QuroTpmGate.observeResponse(url, model, resp.header("x-ratelimit-limit-tokens"))
                     if (!resp.isSuccessful) {
                         val respText = resp.body?.string().orEmpty()
                         val code = resp.code
@@ -727,7 +803,11 @@ class QuroLlmClient(
                         //   对齐非流式 chat() 路径。此前流式 500 直接判死甩给用户，
                         //   而上游（token-plan 中转）常间歇性 500，重试大多能恢复。
                         //   仅当「尚未吐出任何内容」时才重试，避免对已生成内容重复计费/错乱。
-                        if (code in retryableCodes && attempt < maxRetries && contentAcc.isEmpty() && toolAcc.isEmpty()) {
+                        val mayRetry = code in retryableCodes && attempt < maxRetries &&
+                            !(code == 429 && attempt >= 1) && contentAcc.isEmpty() && toolAcc.isEmpty()
+                        if (mayRetry) {
+                            nextRetryDelayMs = retryDelayMillis(code, resp.header("Retry-After"), respText, attempt + 1)
+                            if (code == 429) QuroTpmGate.observe429(url, model, respText, nextRetryDelayMs)
                             retryableHttp = code to respText
                             return@use null
                         }

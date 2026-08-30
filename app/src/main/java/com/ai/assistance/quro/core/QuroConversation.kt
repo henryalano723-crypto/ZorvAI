@@ -4,12 +4,24 @@ import com.ai.assistance.quro.core.cards.QuroChatCard
 import com.ai.assistance.quro.util.QuroDiag
 import java.util.UUID
 
-/** 单条工具结果回传给模型时的最大保留字符数，超出部分就地截断（保留头+尾）。 */
-internal const val TOOL_RESULT_CAP = 1600
+/** 单轮全部工具结果回传给模型时的总字符预算，避免并行工具结果叠加撑爆下一次请求。 */
+internal const val TOOL_RESULTS_ROUND_CAP = 12_000
+
+/** 未分类工具的单条结果预算；高价值工具按类型获得更合适的预算。 */
+internal const val TOOL_RESULT_CAP = 2_400
 
 /** 模型硬输入上限（token）：请求总输入（system + 历史）不得超过此值，否则上游直接 500「context length exceeded」。
  *  contextWindow=0（用户设「不限制」）时本值作为安全硬顶生效，避免「全量无界发送」撑爆模型上限。 */
 internal const val MODEL_MAX_INPUT_TOKENS = 262144
+
+/**
+ * 自动截图是工具链内部的一次性视觉输入，不是用户上传的长期附件。
+ * 通过严格匹配 hidden + user + 固定前缀，只清理 Zorv 自己生成的视觉兜底消息。
+ */
+internal const val AUTO_VISUAL_FALLBACK_PREFIX = "[自动视觉兜底，附图 "
+
+internal fun QuroMessage.isAutoVisualFallback(): Boolean =
+    hidden && role == "user" && content.startsWith(AUTO_VISUAL_FALLBACK_PREFIX)
 
 /**
  * 就地压缩超长工具结果（role=tool 的 content），防止命令类工具（terminal_exec / root_exec 等）
@@ -27,10 +39,41 @@ internal fun compactToolResults(list: List<QuroChatMessage>): List<QuroChatMessa
     }
 }
 
+/**
+ * 工具刚执行完就压缩，而不是等下一次整理历史时才压缩。这样 role=tool、UI 自包含结果、
+ * 执行轨迹和下一轮请求从源头使用同一份受控结果，避免原始控件树/网页正文先进入内存后爆表。
+ */
+internal fun compactImmediateToolResults(results: List<QuroToolResult>): List<QuroToolResult> {
+    if (results.isEmpty()) return results
+    val individuallyCapped = results.map { r ->
+        val cap = toolResultCap(r.name)
+        if (r.result.length > cap) r.copy(result = truncateToolResult(r.result, cap)) else r
+    }
+    val total = individuallyCapped.sumOf { it.result.length }
+    if (total <= TOOL_RESULTS_ROUND_CAP) return individuallyCapped
+
+    val fairCap = (TOOL_RESULTS_ROUND_CAP / individuallyCapped.size).coerceAtLeast(600)
+    return individuallyCapped.map { r ->
+        if (r.result.length > fairCap) r.copy(result = truncateToolResult(r.result, fairCap)) else r
+    }
+}
+
+/** 按信息密度分配预算：读屏最紧，定向查找优先保真，终端/网页保留更多错误尾部。 */
+internal fun toolResultCap(toolName: String?): Int = when (toolName) {
+    "read_screen" -> 2_000
+    "find_ui_element" -> 2_800
+    "screenshot", "visual_analysis" -> 3_000
+    "aci_call", "browser_read", "browser_elements", "http_request" -> 3_600
+    "terminal_exec", "root_exec", "shizuku_exec" -> 4_000
+    "tool_router" -> 5_000
+    else -> TOOL_RESULT_CAP
+}
+
 /** 头部 40% + 尾部 60% + 截断说明：错误 / 退出码通常在尾部，故尾部占比更大。 */
-internal fun truncateToolResult(text: String): String {
-    val head = (TOOL_RESULT_CAP * 4 / 10).coerceAtLeast(200)
-    val tail = (TOOL_RESULT_CAP - head).coerceAtLeast(200)
+internal fun truncateToolResult(text: String, cap: Int = TOOL_RESULT_CAP): String {
+    val safeCap = cap.coerceAtLeast(400)
+    val head = (safeCap * 4 / 10).coerceAtLeast(160)
+    val tail = (safeCap - head).coerceAtLeast(240)
     // 🔧 按「码点」而非 UTF-16 字符截断：原 take/takeLast 可能把 emoji / 代理对切成孤立代理项
     // （lone surrogate）→ 该孤立代理项进入请求体后会让严格上游 JSON 解析失败 → 500。
     val headStr = text.takeCodePoints(head)
@@ -116,6 +159,16 @@ class QuroConversationStore {
     }
 
     /**
+     * 丢弃已经消费或从旧版本遗留的一次性自动截图消息。
+     * 用户主动上传的图片没有自动视觉前缀，绝不会被此方法删除。
+     */
+    fun discardAutoVisualFallbacks(): Int = synchronized(lock) {
+        val before = messages.size
+        messages.removeAll { it.isAutoVisualFallback() }
+        before - messages.size
+    }
+
+    /**
      * 转为发送给 LLM 的消息列表（保留工具调用/结果上下文）。
      *
      * @param contextWindow 输入 token 预算（0=不限制）。非 0 时执行「上下文优化」：
@@ -159,7 +212,7 @@ class QuroConversationStore {
         val ceiling = if (contextWindow > 0) contextWindow.coerceAtMost(MODEL_MAX_INPUT_TOKENS) else MODEL_MAX_INPUT_TOKENS
         if (ceiling <= 0) return pruneOrphanToolMessages(capped)
 
-        val sysTokens = system?.let { estTokens(it.content) } ?: 0
+        val sysTokens = system?.let { estimateChatMessageTokens(QuroChatMessage(it.role, it.content)) } ?: 0
         var budget = ceiling - sysTokens
         val nonSys = capped.filter { it.role != "system" }
         if (budget <= 0) {
@@ -184,7 +237,7 @@ class QuroConversationStore {
         val keptIdx = mutableListOf<Int>()
         // 第一轮：填充普通消息（高优先级，从最新往最旧）
         for ((i, m) in normalIdx.asReversed()) {
-            val t = estTokens(m.content) + (m.toolCalls?.sumOf { estTokens(it.arguments) } ?: 0)
+            val t = estimateChatMessageTokens(m)
             if (keptIdx.isEmpty() && t > budget) {
                 keptIdx.add(i) // 最新一条超预算也强制保留，避免空请求
             } else if (t <= budget) {
@@ -196,7 +249,7 @@ class QuroConversationStore {
         }
         // 第二轮：用剩余预算填充巨型消息（低优先级，放不下跳过不 break）
         for ((i, m) in giantIdx.asReversed()) {
-            val t = estTokens(m.content) + (m.toolCalls?.sumOf { estTokens(it.arguments) } ?: 0)
+            val t = estimateChatMessageTokens(m)
             if (t <= budget) {
                 keptIdx.add(i)
                 budget -= t
@@ -280,6 +333,4 @@ class QuroConversationStore {
         }
     }
 
-    /** token 估算（中文/英文混合取 char/4 近似）。 */
-    private fun estTokens(text: String?): Int = maxOf(1, (text?.length ?: 0) / 4)
 }
