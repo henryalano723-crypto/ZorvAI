@@ -11,6 +11,13 @@ import org.json.JSONObject
  */
 internal object AppMessageIntentCompiler {
     private const val SEARCH_RESULTS_READY_ARG = "_search_results_ready"
+    private val visualStages = setOf(
+        "verify_search_field",
+        "select_contact",
+        "verify_conversation",
+        "verify_draft",
+        "verify_sent",
+    )
 
     data class Intent(
         val appName: String,
@@ -29,7 +36,7 @@ internal object AppMessageIntentCompiler {
         "\\s*(?:然后|并|，|,)?\\s*(?:点击|按)?\\s*(?:发送(?:消息|信息)?|发出|发消息|发信息)\\s*[。.!！]?$",
     )
     private val directSend = Regex(
-        "^\\s*(?:打开|去|在|用)?\\s*(.{1,30}?)(?:里|中|内)?\\s*给\\s*(.{1,40}?)\\s*" +
+        "^\\s*(?:打开|去|在|用)?\\s*(.{1,30}?)(?:里|中|内)?\\s*(?:给|跟|对)\\s*(.{1,40}?)\\s*" +
             "(?:发送(?:消息|信息)?|发消息|发信息|发|说)\\s*[：:]?\\s*(.+?)\\s*[。.!！]?$",
     )
     private val searchThenSend = Regex(
@@ -38,6 +45,16 @@ internal object AppMessageIntentCompiler {
     )
 
     fun hasExplicitSend(userText: String): Boolean = explicitSend.containsMatchIn(userText)
+
+    /** Only this structured marker may keep a message turn open for another visual step. */
+    fun isVisualContinuation(toolResult: String): Boolean {
+        val json = runCatching { JSONObject(toolResult) }.getOrNull() ?: return false
+        val stage = json.optString("stage")
+        return json.optString("workflow") == "message_send" &&
+            json.optString("status") == "needs_visual" &&
+            json.optString("transaction_id").isNotBlank() &&
+            stage in visualStages
+    }
 
     fun parse(userText: String): Intent? {
         val text = userText.trim()

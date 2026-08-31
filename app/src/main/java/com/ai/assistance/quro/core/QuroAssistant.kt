@@ -274,15 +274,11 @@ class QuroAssistant(
                     isLocal && historyRounds <= 0 -> 8
                     else -> historyRounds
                 }
-                val requestSpecs = if (activeVisualMessageTransaction) {
-                    effectiveSpecs.filter { it.name == "send_message_in_app" }
-                } else if (messageSendIntent && !messageTransactionDispatched) {
-                    // A natural-language send request must enter the evidence-gated message
-                    // transaction before the model can touch any focused editor.  Exposing
-                    // input_text/search_in_app here lets a model search the contact correctly,
-                    // then overwrite that still-focused search field with the message body.
-                    // Keep intent extraction flexible by letting the cloud model fill the
-                    // structured tool arguments, but make the first executable path unique.
+                val requestSpecs = if (messageWorkflowPending) {
+                    // Keep the whole send request inside one evidence-gated transaction.  A
+                    // recoverable visual stage and a terminal safety error both belong to
+                    // send_message_in_app; generic tap/input/search tools must never take over
+                    // while the contact or conversation is still unverified.
                     effectiveSpecs.filter { it.name == "send_message_in_app" }
                 } else if (activeToolRouter != null) {
                     activeToolRouter.activeSpecs()
@@ -578,10 +574,33 @@ class QuroAssistant(
                             intent = appSearchIntent,
                             alreadyDispatched = appSearchTransactionDispatched,
                         )
-                        if (rewrittenCalls.any { it.name == "search_in_app" }) {
+                        // Schema restriction is not the security boundary: some providers may
+                        // still emit a stale or hallucinated tool name.  Enforce the transaction
+                        // allow-list again immediately before execution so tap_screen/input_text
+                        // can never run while a message stage is pending.
+                        val enteringMessageTransaction = messageWorkflowPending ||
+                            rewrittenCalls.any { it.name == "send_message_in_app" }
+                        val transactionSafeCalls = if (enteringMessageTransaction) {
+                            rewrittenCalls.filter { it.name == "send_message_in_app" }
+                        } else {
+                            rewrittenCalls
+                        }
+                        if (enteringMessageTransaction && transactionSafeCalls.isEmpty()) {
+                            store.add(
+                                QuroMessage(
+                                    role = "system",
+                                    content = "[消息事务工具被拦截] 联系人、会话或正文尚未验证；" +
+                                        "只允许按最近一次结构化结果调用 send_message_in_app，禁止普通点击和输入。",
+                                    hidden = true,
+                                ),
+                            )
+                            emit()
+                            continue
+                        }
+                        if (transactionSafeCalls.any { it.name == "search_in_app" }) {
                             appSearchTransactionDispatched = true
                         }
-                        if (rewrittenCalls !== result.calls) {
+                        if (transactionSafeCalls !== result.calls) {
                             Log.i(
                                 "QuroAssistant",
                                 if (compiledMessageIntent != null) {
@@ -592,7 +611,7 @@ class QuroAssistant(
                             )
                         }
                         val base = "call_${System.nanoTime()}_$round"
-                        val callsWithId = rewrittenCalls.mapIndexed { idx, c -> c.copy(id = "${base}_$idx") }
+                        val callsWithId = transactionSafeCalls.mapIndexed { idx, c -> c.copy(id = "${base}_$idx") }
                         // 🔑 关键修复：MiMo 等模型在返回 tool_calls 的同时会附带 reasoning_content
                         // （本轮思考过程）。此前 ToolCalls 结果类型不携带 reasoning → 思考内容被直接丢弃，
                         // 模型下一轮在「失忆」状态下做决策，无法链式编排多步工具调用。
@@ -679,11 +698,8 @@ class QuroAssistant(
                             }
                             if (call.name == "send_message_in_app") {
                                 messageSearchResultsReady = false
-                                val structured = runCatching { JSONObject(toolResult.result) }.getOrNull()
-                                messageWorkflowPending = structured?.let {
-                                    it.optString("workflow") == "message_send" &&
-                                        it.optString("status") == "needs_visual"
-                                } ?: false
+                                messageWorkflowPending = AppMessageIntentCompiler
+                                    .isVisualContinuation(toolResult.result)
                                 activeVisualMessageTransaction = messageWorkflowPending
                             }
                         }
@@ -770,6 +786,26 @@ class QuroAssistant(
                         // 轨迹：把工具执行结果写入总线
                         callsWithId.zip(results).forEach { (c, r) ->
                             QuroAgentTrace.result("tool", c.name, r.result)
+                        }
+                        // send_message_in_app owns the entire side-effecting transaction.  Once
+                        // it returns anything other than a structured needs_visual continuation,
+                        // end this assistant turn with that exact safe outcome.  Letting the model
+                        // continue with the full tool set caused the observed failure chain:
+                        // tap_screen(text) failed on WeChat's empty accessibility tree, then
+                        // input_text overwrote the still-focused contact search field.
+                        val terminalMessageResult = callsWithId.zip(results)
+                            .firstOrNull { (call, result) ->
+                                if (call.name != "send_message_in_app") return@firstOrNull false
+                                !AppMessageIntentCompiler.isVisualContinuation(result.result)
+                            }
+                            ?.second
+                            ?.result
+                        if (terminalMessageResult != null) {
+                            lastText = terminalMessageResult
+                            store.add(QuroMessage(role = "assistant", content = lastText))
+                            emit()
+                            finishFluidCloudSafe(context)
+                            return@withContext lastText
                         }
                         // 高层搜索事务已完成并验证页面变化：这是明确终态，立即结束工具循环。
                         // 不再让模型追加 input_text/tap_screen，避免已经搜索成功后继续操作。

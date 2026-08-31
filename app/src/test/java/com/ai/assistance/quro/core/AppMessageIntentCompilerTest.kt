@@ -58,6 +58,36 @@ class AppMessageIntentCompilerTest {
     @Test
     fun recognizesFlexibleNaturalSendWordingForTheMessageToolGate() {
         assertEquals(true, AppMessageIntentCompiler.hasExplicitSend("打开微信跟灵儿说你好"))
+        assertEquals(
+            AppMessageIntentCompiler.Intent("微信", "灵儿", "你好", confirmSend = true),
+            AppMessageIntentCompiler.parse("打开微信跟灵儿说你好"),
+        )
+    }
+
+    @Test
+    fun onlyCompleteStructuredMessageStateKeepsVisualTransactionOpen() {
+        assertEquals(
+            true,
+            AppMessageIntentCompiler.isVisualContinuation(
+                """{"workflow":"message_send","status":"needs_visual","transaction_id":"tx-1","stage":"select_contact"}""",
+            ),
+        )
+        assertEquals(
+            false,
+            AppMessageIntentCompiler.isVisualContinuation(
+                """{"workflow":"message_send","status":"needs_visual","stage":"select_contact"}""",
+            ),
+        )
+        assertEquals(
+            false,
+            AppMessageIntentCompiler.isVisualContinuation("❌ [选择联系人] 未确认进入会话"),
+        )
+        assertEquals(
+            false,
+            AppMessageIntentCompiler.isVisualContinuation(
+                """{"workflow":"message_send","status":"needs_visual","transaction_id":"tx-1","stage":"unknown"}""",
+            ),
+        )
     }
 
     @Test

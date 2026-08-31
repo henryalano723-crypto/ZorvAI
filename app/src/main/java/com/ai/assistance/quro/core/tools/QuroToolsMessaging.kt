@@ -297,14 +297,16 @@ class SendMessageInAppTool : QuroTool {
             "message":{"type":"string","description":"要输入的完整正文"},
             "confirm_send":{"type":"boolean","description":"当前用户是否明确授权立即发送；默认 false","default":false},
             "transaction_id":{"type":"string","description":"自绘页面返回 needs_visual 后必须原样回传的事务 ID"},
-            "resume_stage":{"type":"string","enum":["select_contact","verify_conversation","verify_draft","verify_sent"],"description":"必须与上一次 needs_visual 返回的 stage 完全一致"},
+            "resume_stage":{"type":"string","enum":["verify_search_field","select_contact","verify_conversation","verify_draft","verify_sent"],"description":"必须与上一次 needs_visual 返回的 stage 完全一致"},
             "visual_verified":{"type":"boolean","description":"视觉上是否满足该阶段 instruction 的全部精确条件；不确定必须 false"},
             "action_x":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 x；只在 instruction 要求点击时提供"},
-            "action_y":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 y；只在 instruction 要求点击时提供"}
+            "action_y":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 y；只在 instruction 要求点击时提供"},
+            "candidate_options":{"type":"array","items":{"type":"string"},"description":"select_contact 阶段发现多个联系人精确匹配时，返回画面可见的区分信息；禁止包含群聊或聊天记录"}
         }
     }"""
 
     private enum class VisualStage(val wire: String) {
+        VERIFY_SEARCH_FIELD("verify_search_field"),
         SELECT_CONTACT("select_contact"),
         VERIFY_CONVERSATION("verify_conversation"),
         VERIFY_DRAFT("verify_draft"),
@@ -344,6 +346,25 @@ class SendMessageInAppTool : QuroTool {
         val svc = com.ai.assistance.quro.service.QuroAccessibilityService.instance
             ?: return "❌ 无障碍服务未连接"
 
+        // search_in_app may have already left the target app on a populated, custom-drawn
+        // search-results page. Re-launching the app here can destroy that exact FTS surface and
+        // return to its launcher activity. The handoff is generated only from a matching,
+        // evidence-gated search result in this same assistant turn, so resume the remembered
+        // external window directly and continue with contact selection.
+        if (searchResultsReady) {
+            val searchResultsRoot = ExternalUiTargetSession.rootForAutomation(svc)
+                ?: return "❌ [恢复搜索结果] 无法获得目标应用窗口，已停止"
+            return buildVisualContinuation(
+                context = context,
+                appName = appName,
+                targetPackage = searchResultsRoot.packageName?.toString().orEmpty(),
+                contact = contact,
+                message = message,
+                confirmSend = confirmSend,
+                initialStage = VisualStage.SELECT_CONTACT,
+            )
+        }
+
         val launched = SearchAndLaunchAppTool().run(
             context,
             JSONObject().put("app_name", appName).toString(),
@@ -352,24 +373,33 @@ class SendMessageInAppTool : QuroTool {
         Thread.sleep(900)
         var root = ExternalUiTargetSession.rootForAutomation(svc)
             ?: return "❌ [恢复现场] 无法获得目标应用窗口，未执行后续操作"
-
-        if (searchResultsReady) {
-            return buildVisualContinuation(
-                context = context,
-                appName = appName,
-                targetPackage = root.packageName?.toString().orEmpty(),
-                contact = contact,
-                message = message,
-                confirmSend = confirmSend,
-            )
-        }
+        val targetPackage = root.packageName?.toString().orEmpty()
 
         var searchEditor = findSearchEditor(root)
         if (searchEditor == null) {
             val activated = ActivateAppSearchTool().run(context, "{}")
-            if (!activated.startsWith("✅")) return "❌ [识别搜索入口] $activated"
-            root = ExternalUiTargetSession.rootForAutomation(svc)
-                ?: return "❌ [恢复搜索现场] 目标应用窗口已丢失"
+            if (!activated.startsWith("✅")) {
+                return buildVisualContinuation(
+                    context = context,
+                    appName = appName,
+                    targetPackage = targetPackage,
+                    contact = contact,
+                    message = message,
+                    confirmSend = confirmSend,
+                    initialStage = VisualStage.VERIFY_SEARCH_FIELD,
+                    retryNotice = "搜索入口动作已尝试，但无障碍无法确认自绘搜索框；请直接核对当前画面，禁止重新打开应用或调用普通输入工具。",
+                )
+            }
+            root = ExternalUiTargetSession.rootForAutomation(svc) ?: return buildVisualContinuation(
+                context = context,
+                appName = appName,
+                targetPackage = targetPackage,
+                contact = contact,
+                message = message,
+                confirmSend = confirmSend,
+                initialStage = VisualStage.VERIFY_SEARCH_FIELD,
+                retryNotice = "搜索动作已完成，但无障碍无法恢复自绘页面；请从当前截图确认唯一搜索框。",
+            )
             searchEditor = findSearchEditor(root)
             if (searchEditor == null && svc.windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }) {
                 val pasted = PasteFocusedTextTool().run(
@@ -384,53 +414,177 @@ class SendMessageInAppTool : QuroTool {
                         contact = contact,
                         message = message,
                         confirmSend = confirmSend,
+                        initialStage = VisualStage.SELECT_CONTACT,
                     )
                 } else {
-                    "❌ [输入联系人] $pasted"
+                    buildVisualContinuation(
+                        context = context,
+                        appName = appName,
+                        targetPackage = targetPackage,
+                        contact = contact,
+                        message = message,
+                        confirmSend = confirmSend,
+                        initialStage = VisualStage.VERIFY_SEARCH_FIELD,
+                        retryNotice = "自绘搜索框输入未取得证据；请重新核对搜索框中心，禁止输入消息正文。",
+                    )
                 }
             }
         }
-        searchEditor ?: return "❌ [识别搜索入口] 搜索已激活但没有可靠编辑框或输入法，已停止"
+        searchEditor ?: return buildVisualContinuation(
+            context = context,
+            appName = appName,
+            targetPackage = targetPackage,
+            contact = contact,
+            message = message,
+            confirmSend = confirmSend,
+            initialStage = VisualStage.VERIFY_SEARCH_FIELD,
+            retryNotice = "搜索页已激活，但无障碍没有暴露编辑框；请视觉确认唯一搜索框。",
+        )
         if (!setAndVerify(searchEditor, contact)) {
-            return "❌ [输入联系人] 未能覆盖输入并回读精确联系人，已停止"
+            return buildVisualContinuation(
+                context = context,
+                appName = appName,
+                targetPackage = targetPackage,
+                contact = contact,
+                message = message,
+                confirmSend = confirmSend,
+                initialStage = VisualStage.VERIFY_SEARCH_FIELD,
+                retryNotice = "无障碍编辑框无法覆盖并回读联系人；请视觉核对搜索框并改用 Agent 输入法，禁止输入消息正文。",
+            )
         }
 
         Thread.sleep(700)
-        root = ExternalUiTargetSession.rootForAutomation(svc)
-            ?: return "❌ [读取搜索结果] 目标应用窗口已丢失"
-        val contactMatch = exactClickableMatches(root, contact)
+        root = ExternalUiTargetSession.rootForAutomation(svc) ?: return buildVisualContinuation(
+            context = context,
+            appName = appName,
+            targetPackage = targetPackage,
+            contact = contact,
+            message = message,
+            confirmSend = confirmSend,
+            initialStage = VisualStage.SELECT_CONTACT,
+            retryNotice = "联系人已输入，但无障碍无法读取自绘搜索结果；请仅核对联系人分区。",
+        )
+        val contactMatch = exactContactMatches(root, contact)
         if (contactMatch.size != 1) {
-            return if (contactMatch.isEmpty()) {
-                "❌ [选择联系人] 没有找到精确匹配“$contact”，拒绝点相似结果"
-            } else {
-                "❌ [选择联系人] 找到 ${contactMatch.size} 个可点击的精确匹配，无法唯一确定，拒绝猜测"
-            }
+            return buildVisualContinuation(
+                context = context,
+                appName = appName,
+                targetPackage = targetPackage,
+                contact = contact,
+                message = message,
+                confirmSend = confirmSend,
+                initialStage = VisualStage.SELECT_CONTACT,
+                retryNotice = if (contactMatch.isEmpty()) {
+                    "无障碍没有暴露联系人结果；必须从截图的联系人分区核对，禁止把群聊或聊天记录当联系人。"
+                } else {
+                    "无障碍发现多个同名结果；必须从截图区分真实联系人，无法唯一时返回候选供用户选择。"
+                },
+            )
         }
         val beforeConversation = screenFingerprint(root)
-        if (!clickNode(svc, contactMatch.single())) return "❌ [选择联系人] 点击动作未能派发"
-        root = waitForChangedRoot(svc, beforeConversation)
-            ?: return "❌ [选择联系人] 点击后界面没有变化，未确认进入会话"
+        if (!clickNode(svc, contactMatch.single())) return buildVisualContinuation(
+            context = context,
+            appName = appName,
+            targetPackage = targetPackage,
+            contact = contact,
+            message = message,
+            confirmSend = confirmSend,
+            initialStage = VisualStage.SELECT_CONTACT,
+            retryNotice = "无障碍联系人点击未能派发；请从截图重新定位联系人分区中的唯一精确结果。",
+        )
+        root = waitForChangedRoot(svc, beforeConversation) ?: return buildVisualContinuation(
+            context = context,
+            appName = appName,
+            targetPackage = targetPackage,
+            contact = contact,
+            message = message,
+            confirmSend = confirmSend,
+            initialStage = VisualStage.SELECT_CONTACT,
+            retryNotice = "联系人点击后无障碍没有确认页面变化；请重新核对结果，禁止输入正文。",
+        )
 
         if (!hasConversationIdentity(root, contact)) {
-            return "❌ [核对会话] 页面顶部未找到精确联系人“$contact”，禁止输入或发送"
+            return buildVisualContinuation(
+                context = context,
+                appName = appName,
+                targetPackage = targetPackage,
+                contact = contact,
+                message = message,
+                confirmSend = confirmSend,
+                initialStage = VisualStage.VERIFY_CONVERSATION,
+                retryNotice = "无障碍无法读取会话标题；必须视觉确认已经离开搜索页且标题精确匹配。",
+            )
         }
-        val messageEditor = selectMessageEditor(root, searchEditor)
-            ?: return "❌ [定位消息框] 未找到唯一可靠的消息输入框"
+        val messageEditor = selectMessageEditor(root)
+            ?: return buildVisualContinuation(
+                context = context,
+                appName = appName,
+                targetPackage = targetPackage,
+                contact = contact,
+                message = message,
+                confirmSend = confirmSend,
+                initialStage = VisualStage.VERIFY_CONVERSATION,
+                retryNotice = "无障碍无法定位唯一消息框；请视觉确认会话标题及底部输入框。",
+            )
         if (!setAndVerify(messageEditor, message)) {
-            return "❌ [输入消息] 正文未通过回读验证，禁止发送"
+            return buildVisualContinuation(
+                context = context,
+                appName = appName,
+                targetPackage = targetPackage,
+                contact = contact,
+                message = message,
+                confirmSend = confirmSend,
+                initialStage = VisualStage.VERIFY_CONVERSATION,
+                retryNotice = "无障碍消息框无法写入并回读正文；请视觉确认会话后改用 Agent 输入法。",
+            )
         }
         if (!confirmSend) {
             return "✅ [MESSAGE_DRAFT_VERIFIED] 已核对会话“$contact”并回读确认正文；按授权要求停在草稿，未发送"
         }
 
-        val sendRoot = ExternalUiTargetSession.rootForAutomation(svc)
-            ?: return "❌ [发送前复核] 目标应用窗口已丢失，禁止发送"
+        val sendRoot = ExternalUiTargetSession.rootForAutomation(svc) ?: return buildVisualContinuation(
+            context = context,
+            appName = appName,
+            targetPackage = targetPackage,
+            contact = contact,
+            message = message,
+            confirmSend = confirmSend,
+            initialStage = VisualStage.VERIFY_DRAFT,
+            retryNotice = "发送前无障碍无法恢复页面；必须从截图复核会话、正文和发送按钮。",
+        )
         if (!hasConversationIdentity(sendRoot, contact) || !editorContains(sendRoot, message)) {
-            return "❌ [发送前复核] 联系人或正文与授权不一致，禁止发送"
+            return buildVisualContinuation(
+                context = context,
+                appName = appName,
+                targetPackage = targetPackage,
+                contact = contact,
+                message = message,
+                confirmSend = confirmSend,
+                initialStage = VisualStage.VERIFY_DRAFT,
+                retryNotice = "无障碍无法同时复核联系人和正文；必须视觉逐字确认后才允许发送。",
+            )
         }
         val sendNode = findSendAction(sendRoot)
-            ?: return "❌ [发送] 未找到语义明确且唯一的发送控件，禁止用回车猜测"
-        if (!clickNode(svc, sendNode)) return "❌ [发送] 发送控件拒绝点击"
+            ?: return buildVisualContinuation(
+                context = context,
+                appName = appName,
+                targetPackage = targetPackage,
+                contact = contact,
+                message = message,
+                confirmSend = confirmSend,
+                initialStage = VisualStage.VERIFY_DRAFT,
+                retryNotice = "无障碍没有暴露唯一发送按钮；请视觉复核正文并定位发送按钮，禁止用回车猜测。",
+            )
+        if (!clickNode(svc, sendNode)) return buildVisualContinuation(
+            context = context,
+            appName = appName,
+            targetPackage = targetPackage,
+            contact = contact,
+            message = message,
+            confirmSend = confirmSend,
+            initialStage = VisualStage.VERIFY_DRAFT,
+            retryNotice = "无障碍发送点击未能派发；请重新视觉复核并定位发送按钮。",
+        )
 
         repeat(10) {
             Thread.sleep(250)
@@ -439,7 +593,16 @@ class SendMessageInAppTool : QuroTool {
                 return "✅ [MESSAGE_SEND_CONFIRMED] 已向“$contact”发送，并通过输入框清空及消息正文回读确认"
             }
         }
-        return "⚠️ [MESSAGE_SEND_PENDING_VERIFICATION] 已点击发送，但未同时取得输入框清空和消息正文证据；不得报告发送成功"
+        return buildVisualContinuation(
+            context = context,
+            appName = appName,
+            targetPackage = targetPackage,
+            contact = contact,
+            message = message,
+            confirmSend = confirmSend,
+            initialStage = VisualStage.VERIFY_SENT,
+            retryNotice = "发送点击已派发，但无障碍未同时取得输入框清空和新消息正文证据；必须视觉核对，不得提前报告成功。",
+        )
     }
 
     /**
@@ -456,6 +619,8 @@ class SendMessageInAppTool : QuroTool {
         contact: String,
         message: String,
         confirmSend: Boolean,
+        initialStage: VisualStage = VisualStage.SELECT_CONTACT,
+        retryNotice: String? = null,
     ): String {
         if (targetPackage.isBlank() || targetPackage == context.packageName) {
             return "❌ [创建消息事务] 目标应用身份无效，已停止"
@@ -469,10 +634,10 @@ class SendMessageInAppTool : QuroTool {
             message = message,
             confirmSend = confirmSend,
             createdAtMs = System.currentTimeMillis(),
-            stage = VisualStage.SELECT_CONTACT,
+            stage = initialStage,
         )
         visualTransactions[transaction.id] = transaction
-        return captureVisualStage(context, transaction)
+        return captureVisualStage(context, transaction, retryNotice)
     }
 
     private fun resumeVisualTransaction(context: Context, args: JSONObject, transactionId: String): String {
@@ -484,6 +649,21 @@ class SendMessageInAppTool : QuroTool {
             return "❌ [消息事务阶段不匹配] 当前必须处理 ${transaction.stage.wire}，拒绝跳步"
         }
         if (!args.optBoolean("visual_verified", false)) {
+            if (transaction.stage == VisualStage.SELECT_CONTACT) {
+                val options = args.optJSONArray("candidate_options")?.let { array ->
+                    (0 until array.length()).mapNotNull { index ->
+                        array.optString(index).trim().takeIf { it.isNotEmpty() }
+                    }.distinct().take(8)
+                }.orEmpty()
+                if (options.size >= 2) {
+                    visualTransactions.remove(transactionId)
+                    return buildString {
+                        append("⚠️ [MESSAGE_CONTACT_CHOICE_REQUIRED] 找到多个联系人“${transaction.contact}”，请选择：\n")
+                        options.forEachIndexed { index, option -> append("${index + 1}. $option\n") }
+                        append("${options.size + 1}. 都不是")
+                    }
+                }
+            }
             visualTransactions.remove(transactionId)
             return "❌ [视觉核对未通过] 目标不唯一、内容不符或无法确认；事务已安全终止"
         }
@@ -497,6 +677,28 @@ class SendMessageInAppTool : QuroTool {
         }
 
         return when (transaction.stage) {
+            VisualStage.VERIFY_SEARCH_FIELD -> {
+                val point = requiredVisualPoint(args, transaction)
+                    ?: return "❌ [定位搜索框] 缺少唯一搜索框的有效中心坐标"
+                if (!dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())) {
+                    return "❌ [定位搜索框] 点击动作未能派发"
+                }
+                Thread.sleep(300)
+                val pasted = PasteFocusedTextTool().run(
+                    context,
+                    JSONObject().put("text", transaction.contact).toString(),
+                )
+                if (!pasted.startsWith("⚠️")) {
+                    return captureVisualStage(
+                        context,
+                        transaction,
+                        "搜索框点击后仍无法通过 Agent 输入法输入联系人：$pasted 请重新核对搜索框，禁止输入消息正文。",
+                    )
+                }
+                Thread.sleep(700)
+                transaction.stage = VisualStage.SELECT_CONTACT
+                captureVisualStage(context, transaction)
+            }
             VisualStage.SELECT_CONTACT -> {
                 val point = requiredVisualPoint(args, transaction) ?: return "❌ [选择联系人] 缺少唯一目标的有效中心坐标"
                 val beforeConversation = captureAppSurfaceFingerprint(svc)
@@ -554,10 +756,12 @@ class SendMessageInAppTool : QuroTool {
         retryNotice: String? = null,
     ): String {
         val stageQuestion = when (transaction.stage) {
+            VisualStage.VERIFY_SEARCH_FIELD ->
+                "确认当前目标应用已进入全局搜索页，并定位顶部唯一搜索输入框中心；不要定位联系人结果或消息输入框"
             VisualStage.SELECT_CONTACT ->
-                "当前联系人结果列表中，精确定位名称为“${transaction.contact}”的唯一可点击结果"
+                "仅在联系人分区中核对名称精确等于“${transaction.contact}”的联系人；排除群聊分区和聊天记录正文"
             VisualStage.VERIFY_CONVERSATION ->
-                "核对当前会话顶部名称是否精确等于“${transaction.contact}”，并定位唯一的消息输入框中心"
+                "确认已经离开搜索结果页：顶部会话名称精确等于“${transaction.contact}”，画面不再显示联系人/群聊/聊天记录结果分区；定位底部唯一消息输入框中心，禁止选择顶部搜索框"
             VisualStage.VERIFY_DRAFT ->
                 "核对当前会话名称为“${transaction.contact}”，且输入框内正文与用户原始正文逐字一致；${if (transaction.confirmSend) "同时定位唯一发送按钮中心" else "不要发送"}"
             VisualStage.VERIFY_SENT ->
@@ -614,14 +818,21 @@ class SendMessageInAppTool : QuroTool {
     }
 
     private fun visualStageInstruction(transaction: VisualTransaction): String = when (transaction.stage) {
+        VisualStage.VERIFY_SEARCH_FIELD ->
+            "只有画面明确是目标应用的全局搜索页且顶部搜索输入框唯一时，才调用 send_message_in_app，" +
+                "原样回传 transaction_id、resume_stage=verify_search_field、visual_verified=true 和搜索框中心 action_x/action_y。" +
+                "不得调用 input_text、tap_screen、search_and_launch_app 或 activate_app_search；无法确认时 visual_verified=false。"
         VisualStage.SELECT_CONTACT ->
-            "只有画面中恰好一个结果的可见名称与“${transaction.contact}”完全一致时，才调用 send_message_in_app，" +
+            "只检查‘联系人’分区，禁止把群聊名称、群聊成员命中或聊天记录正文当作联系人。" +
+                "只有联系人分区中恰好一个结果的可见名称与“${transaction.contact}”完全一致时，才调用 send_message_in_app，" +
                 "原样回传 transaction_id、resume_stage=select_contact、visual_verified=true 和该结果中心 action_x/action_y。" +
-                "不要再点搜索图标，不要直接调用 tap_screen，不要报告完成；不唯一或不确定时 visual_verified=false。"
+                "若联系人分区有多个精确同名联系人，visual_verified=false，并用 candidate_options 返回每个候选在画面可见的备注/微信号尾号/地区等区分信息；" +
+                "不要再点搜索图标，不要直接调用 tap_screen，不要报告完成。"
         VisualStage.VERIFY_CONVERSATION ->
-            "只有顶部会话名称精确等于“${transaction.contact}”且消息输入框唯一时，才调用 send_message_in_app，" +
+            "必须确认已离开搜索页，画面不再显示联系人、群聊或聊天记录结果分区；" +
+                "只有顶部会话名称精确等于“${transaction.contact}”且底部消息输入框唯一时，才调用 send_message_in_app，" +
                 "原样回传 transaction_id、resume_stage=verify_conversation、visual_verified=true 和输入框中心 action_x/action_y。" +
-                "标题不符或输入框不唯一时 visual_verified=false，禁止输入。"
+                "顶部搜索框绝不是消息输入框；标题不符、仍在搜索页或底部输入框不唯一时 visual_verified=false，禁止输入。"
         VisualStage.VERIFY_DRAFT ->
             "必须确认会话名称精确等于“${transaction.contact}”且输入框正文与原始正文逐字一致。" +
                 if (transaction.confirmSend) {
@@ -681,27 +892,57 @@ class SendMessageInAppTool : QuroTool {
         return editors.firstOrNull { it.snapshot == winner }?.node
     }
 
-    private fun exactClickableMatches(root: AccessibilityNodeInfo, expected: String): List<AccessibilityNodeInfo> {
+    /**
+     * Accept an accessibility match only when its nearest preceding result-section header proves
+     * that it belongs to contacts. A bare exact text match is insufficient: the same text may be
+     * a group name, a group-member hit, or chat-record content. Layouts without section evidence
+     * intentionally fall back to the visual transaction.
+     */
+    private fun exactContactMatches(root: AccessibilityNodeInfo, expected: String): List<AccessibilityNodeInfo> {
+        val indexedNodes = collectNodes(root)
+        val contactHeaders = setOf("联系人", "contacts", "contact")
+        val nonContactHeaders = setOf("群聊", "群组", "聊天记录", "groupchats", "groups", "chathistory")
+        val sectionHeaders = indexedNodes.mapNotNull { indexed ->
+            val label = normalize(indexed.node.text?.toString().orEmpty())
+            when (label) {
+                in contactHeaders -> indexed.snapshot.top to true
+                in nonContactHeaders -> indexed.snapshot.top to false
+                else -> null
+            }
+        }.sortedBy { it.first }
         val unique = linkedMapOf<String, AccessibilityNodeInfo>()
-        collectNodes(root).forEach { indexed ->
+        indexedNodes.forEach { indexed ->
             if (normalize(indexed.node.text?.toString().orEmpty()) != normalize(expected)) return@forEach
             val target = clickableAncestor(indexed.node) ?: return@forEach
             val b = Rect().also { target.getBoundsInScreen(it) }
+            val nearestSection = sectionHeaders.lastOrNull { (top, _) -> top < b.centerY() }
+            if (nearestSection?.second != true) return@forEach
             unique["${b.left},${b.top},${b.right},${b.bottom}"] = target
         }
         return unique.values.toList()
     }
 
     private fun hasConversationIdentity(root: AccessibilityNodeInfo, contact: String): Boolean {
-        val maxTop = root.window?.let { rootBounds(root).height() * 38 / 100 } ?: 900
-        return collectNodes(root).any {
+        val nodes = collectNodes(root)
+        val height = rootBounds(root).height().coerceAtLeast(1)
+        val maxTop = height * 30 / 100
+        val resultSectionLabels = setOf("联系人", "群聊", "群组", "聊天记录", "contacts", "groupchats", "chathistory")
+        if (nodes.any { normalize(it.node.text?.toString().orEmpty()) in resultSectionLabels }) return false
+        // A top-half editable field is a search surface, never a conversation composer.
+        if (nodes.any { it.node.isEditable && it.snapshot.top < height * 45 / 100 }) return false
+        val exactTitle = nodes.any {
             !it.node.isEditable && it.snapshot.top <= maxTop &&
                 normalize(it.node.text?.toString().orEmpty()) == normalize(contact)
         }
+        val bottomComposer = nodes.any { it.node.isEditable && it.snapshot.top >= height * 45 / 100 }
+        return exactTitle && bottomComposer
     }
 
-    private fun selectMessageEditor(root: AccessibilityNodeInfo, oldSearchEditor: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val editors = collectNodes(root).filter { it.node.isEditable && it.node.isVisibleToUser }
+    private fun selectMessageEditor(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val minTop = rootBounds(root).height().coerceAtLeast(1) * 45 / 100
+        val editors = collectNodes(root).filter {
+            it.node.isEditable && it.node.isVisibleToUser && it.snapshot.top >= minTop
+        }
         if (editors.size == 1) return editors.single().node
         // Conversation composers are normally the lowest visible editor. Require a strict vertical
         // winner; equal/overlapping candidates remain ambiguous and stop the transaction.
