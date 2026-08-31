@@ -29,6 +29,8 @@ internal object ExternalUiTargetSession {
     private const val TAG = "ExternalUiTargetSession"
     private const val PREFS = "external_ui_target"
     private const val MAX_AGE_MS = 15 * 60 * 1000L
+    private const val FOREGROUND_SETTLE_ATTEMPTS = 8
+    private const val FOREGROUND_SETTLE_DELAY_MS = 125L
 
     fun remember(context: Context, packageName: String) {
         if (packageName.isBlank() || packageName == context.packageName) return
@@ -57,10 +59,43 @@ internal object ExternalUiTargetSession {
 
     internal fun rememberedPackage(context: Context): String? = current(context)
 
+    /**
+     * Returning from a target app to Zorv briefly exposes the launcher (or no accessibility
+     * root) before QuroMainActivity becomes resumed. A model/tool continuation can arrive in
+     * that transition window, so sample for a short bounded period before treating another
+     * package as a real unsafe foreground change.
+     */
+    internal fun <T> awaitTrustedSurface(
+        initial: T?,
+        ownPackage: String,
+        targetPackage: String,
+        attempts: Int,
+        packageOf: (T?) -> String?,
+        next: () -> T?,
+    ): T? {
+        var candidate = initial
+        repeat(attempts.coerceAtLeast(1)) { attempt ->
+            val packageName = packageOf(candidate)
+            if (packageName == ownPackage || packageName == targetPackage) return candidate
+            if (attempt + 1 < attempts) candidate = next()
+        }
+        return null
+    }
+
     fun rootForAutomation(service: QuroAccessibilityService): AccessibilityNodeInfo? {
-        val root = service.actionableRoot()
-        val target = current(service) ?: return root
-        val foreground = root?.packageName?.toString()
+        val target = current(service) ?: return service.actionableRoot()
+        val root = awaitTrustedSurface(
+            initial = service.actionableRoot(),
+            ownPackage = service.packageName,
+            targetPackage = target,
+            attempts = FOREGROUND_SETTLE_ATTEMPTS,
+            packageOf = { it?.packageName?.toString() },
+            next = {
+                Thread.sleep(FOREGROUND_SETTLE_DELAY_MS)
+                service.actionableRoot()
+            },
+        ) ?: return null
+        val foreground = root.packageName?.toString()
         if (foreground == target) {
             // remember() already captures task identity asynchronously. Never issue a synchronous
             // Shizuku dumpsys on every read/tap/input: a degraded Shizuku UserService can otherwise

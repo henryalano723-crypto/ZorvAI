@@ -2,9 +2,50 @@ package com.ai.assistance.quro.core.tools
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Test
 
 class ExternalUiTargetSessionTest {
+    @Test
+    fun awaitTrustedSurface_waitsThroughLauncherTransitionUntilZorvIsReady() {
+        val launcher = Any()
+        val missing = Any()
+        val zorv = Any()
+        val packages = mapOf(
+            launcher to "com.huawei.android.launcher",
+            missing to null,
+            zorv to "com.ai.assistance.quro",
+        )
+        val remaining = mutableListOf(missing, zorv)
+
+        val actual = ExternalUiTargetSession.awaitTrustedSurface(
+            initial = launcher,
+            ownPackage = "com.ai.assistance.quro",
+            targetPackage = "com.tencent.mm",
+            attempts = 4,
+            packageOf = { packages[it] },
+            next = { remaining.removeAt(0) },
+        )
+
+        assertSame(zorv, actual)
+    }
+
+    @Test
+    fun awaitTrustedSurface_rejectsStableUnrelatedApp() {
+        val unrelated = Any()
+
+        val actual = ExternalUiTargetSession.awaitTrustedSurface(
+            initial = unrelated,
+            ownPackage = "com.ai.assistance.quro",
+            targetPackage = "com.tencent.mm",
+            attempts = 3,
+            packageOf = { "example.unrelated" },
+            next = { unrelated },
+        )
+
+        assertNull(actual)
+    }
+
     @Test
     fun parseTaskIdentity_returnsExactTargetTaskInsteadOfMostRecentTask() {
         val dump = """
