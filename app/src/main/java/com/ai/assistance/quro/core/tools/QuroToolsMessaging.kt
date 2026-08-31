@@ -323,7 +323,7 @@ class SendMessageInAppTool : QuroTool {
             "visual_verified":{"type":"boolean","description":"视觉上是否满足该阶段 instruction 的全部精确条件；不确定必须 false"},
             "action_x":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 x；只在 instruction 要求点击时提供"},
             "action_y":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 y；只在 instruction 要求点击时提供"},
-            "candidate_options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"action_x":{"type":"integer"},"action_y":{"type":"integer"}},"required":["label","action_x","action_y"]},"description":"select_contact 阶段发现多个联系人精确匹配时，返回每个联系人可见区分信息及该行中心坐标；禁止包含群聊或聊天记录"},
+            "candidate_options":{"type":"array","items":{"type":"object","properties":{"section":{"type":"string","enum":["contact","group","chat_history","web_search","other"]},"label":{"type":"string"},"action_x":{"type":"integer"},"action_y":{"type":"integer"}},"required":["section","label","action_x","action_y"]},"description":"select_contact 阶段必须返回画面中每个同名文字命中，并按最近的可见分区标题归类；代码只接受 section=contact 的精确联系人，字号和高亮不构成新候选"},
             "cancel_contact_choice":{"type":"boolean","description":"用户在候选选择中明确回答都不是或取消时为 true"}
         }
     }"""
@@ -355,7 +355,7 @@ class SendMessageInAppTool : QuroTool {
         var pendingContactChoices: List<ContactChoice> = emptyList(),
     )
 
-    private data class ContactChoice(val label: String, val x: Int, val y: Int)
+    internal data class ContactChoice(val section: String, val label: String, val x: Int, val y: Int)
 
     companion object {
         private const val VISUAL_TRANSACTION_TTL_MS = 5 * 60 * 1000L
@@ -417,6 +417,32 @@ class SendMessageInAppTool : QuroTool {
             val exactMatches = labels.indices.filter { labels[it].trim().equals(userText.trim(), ignoreCase = true) }
             return exactMatches.singleOrNull()
         }
+
+        internal fun isExactContactSectionCandidate(contact: String, section: String, label: String): Boolean {
+            val wanted = contact.trim()
+            val visible = label.trim()
+            if (wanted.isEmpty() || visible.isEmpty()) return false
+            if (section.trim().lowercase() != "contact") return false
+            if (visible.contains("群聊") || visible.contains("聊天记录") ||
+                visible.contains("群成员") || visible.contains("网络搜索")
+            ) return false
+            // Repeated text, font size and highlight colour are not separate targets.  Accept a
+            // candidate only when the vision result explicitly assigns the exact name to the
+            // Contacts section/row (for example "灵儿｜微信号尾号 1234" or "灵儿 联系人").
+            if (visible == wanted) return true
+            if (!visible.startsWith(wanted)) return false
+            val suffix = visible.removePrefix(wanted)
+            return listOf("｜", "|", " ", "（", "(", "·", "-").any(suffix::startsWith)
+        }
+
+        internal fun exactContactSectionCandidates(
+            contact: String,
+            candidates: List<ContactChoice>,
+        ): List<ContactChoice> = candidates
+            .filter { isExactContactSectionCandidate(contact, it.section, it.label) }
+            // A highlighted glyph and the normal-sized row label can be reported separately by
+            // vision even though they point at the same row centre. Count the row only once.
+            .distinctBy { Triple(it.section.trim().lowercase(), it.x, it.y) }
 
         private fun pruneExpiredVisualTransactions() {
             val cutoff = System.currentTimeMillis() - VISUAL_TRANSACTION_TTL_MS
@@ -773,38 +799,49 @@ class SendMessageInAppTool : QuroTool {
             visualTransactions.remove(transactionId)
             return "✅ [MESSAGE_CONTACT_CHOICE_CANCELLED] 已取消本次联系人选择，未输入或发送消息"
         }
-        if (!args.optBoolean("visual_verified", false)) {
-            if (transaction.stage == VisualStage.SELECT_CONTACT) {
-                val options = args.optJSONArray("candidate_options")?.let { array ->
-                    (0 until array.length()).mapNotNull { index ->
-                        val item = array.optJSONObject(index) ?: return@mapNotNull null
-                        val label = item.optString("label").trim()
-                        val x = item.optInt("action_x", -1)
-                        val y = item.optInt("action_y", -1)
-                        ContactChoice(label, x, y).takeIf {
-                            label.isNotEmpty() && x in 0 until transaction.screenshotWidth &&
-                                y in 0 until transaction.screenshotHeight
-                        }
-                    }.distinctBy { Triple(it.label, it.x, it.y) }.take(8)
-                }.orEmpty()
-                if (options.isNotEmpty()) {
-                    transaction.pendingContactChoices = options
-                    return buildString {
-                        append("⚠️ [MESSAGE_CONTACT_CHOICE_REQUIRED] 找到多个联系人“${transaction.contact}”，请选择：\n")
-                        options.forEachIndexed { index, option -> append("${index + 1}. ${option.label}\n") }
-                        append("${options.size + 1}. 都不是")
+        if (transaction.stage == VisualStage.SELECT_CONTACT) {
+            // Never trust the model's count or visual_verified flag for a search result page.
+            // Every textual hit must carry a section and local code alone decides which rows are
+            // real contacts. This keeps OCR/highlight fluctuations from changing the outcome.
+            val options = args.optJSONArray("candidate_options")?.let { array ->
+                (0 until array.length()).mapNotNull { index ->
+                    val item = array.optJSONObject(index) ?: return@mapNotNull null
+                    val section = item.optString("section").trim().lowercase()
+                    val label = item.optString("label").trim()
+                    val x = item.optInt("action_x", -1)
+                    val y = item.optInt("action_y", -1)
+                    ContactChoice(section, label, x, y).takeIf {
+                        label.isNotEmpty() && x in 0 until transaction.screenshotWidth &&
+                            y in 0 until transaction.screenshotHeight
                     }
                 }
-                if (transaction.contactVisualRetries < 1) {
-                    transaction.contactVisualRetries += 1
-                    return captureVisualStage(
-                        context,
-                        transaction,
-                        "上一张图未能唯一确认联系人。请重新只检查‘联系人’分区：" +
-                            "若有一个精确结果则返回坐标；若有多个则必须用 candidate_options 列出可见区分信息。",
-                    )
+            }.orEmpty()
+            val contactOptions = exactContactSectionCandidates(transaction.contact, options)
+            val singleton = contactOptions.singleOrNull()
+            if (singleton != null) {
+                args.put("visual_verified", true)
+                    .put("action_x", singleton.x)
+                    .put("action_y", singleton.y)
+            } else if (contactOptions.size >= 2) {
+                transaction.pendingContactChoices = contactOptions
+                return buildString {
+                    append("⚠️ [MESSAGE_CONTACT_CHOICE_REQUIRED] 找到多个联系人“${transaction.contact}”，请选择：\n")
+                    contactOptions.forEachIndexed { index, option -> append("${index + 1}. ${option.label}\n") }
+                    append("${contactOptions.size + 1}. 都不是")
                 }
+            } else if (transaction.contactVisualRetries < 1) {
+                transaction.contactVisualRetries += 1
+                return captureVisualStage(
+                    context,
+                    transaction,
+                    "上一张图的候选缺少可验证的联系人分区归属。请重新列出画面中每个同名文字命中，" +
+                        "并为每项返回 candidate_options.section；本地代码将过滤非联系人分区。",
+                )
+            } else {
+                visualTransactions.remove(transactionId)
+                return "❌ [联系人分区核对未通过] 没有可验证的联系人分区精确候选；事务已安全终止"
             }
+        } else if (!args.optBoolean("visual_verified", false)) {
             visualTransactions.remove(transactionId)
             return "❌ [视觉核对未通过] 目标不唯一、内容不符或无法确认；事务已安全终止"
         }
@@ -1083,10 +1120,12 @@ class SendMessageInAppTool : QuroTool {
                 "原样回传 transaction_id、observation_version、resume_stage=verify_search_field、visual_verified=true 和搜索框中心 action_x/action_y。" +
                 "不得调用 input_text、tap_screen、search_and_launch_app 或 activate_app_search；无法确认时 visual_verified=false。"
         VisualStage.SELECT_CONTACT ->
-            "只检查‘联系人’分区，禁止把群聊名称、群聊成员命中或聊天记录正文当作联系人。" +
+            "先按最近的分区标题给每一行归类；文字出现次数、字号大小和高亮颜色都不代表联系人数量。" +
+                "只检查‘联系人’或标注为‘联系人’的结果行，禁止把群聊名称、群聊成员命中、聊天记录正文或网络搜索当作联系人。" +
                 "只有联系人分区中恰好一个结果的可见名称与“${transaction.contact}”完全一致时，才调用 send_message_in_app，" +
                 "原样回传 transaction_id、observation_version、resume_stage=select_contact、visual_verified=true 和该结果中心 action_x/action_y。" +
-                "若联系人分区有多个精确同名联系人，visual_verified=false，并用 candidate_options 返回每个候选在画面可见的备注/微信号尾号/地区等区分信息，以及该联系人行中心 action_x/action_y；" +
+                "无论你认为有几个联系人，都必须用 candidate_options 列出画面中每个包含同名文字的结果；section 按最近的分区标题分别填写 contact、group、chat_history、web_search 或 other，label 写该行可见文字和区分信息，并返回该行中心 action_x/action_y。" +
+                "不要自行省略其他分区的同名命中；本地代码会过滤，只按 section=contact 的精确行决定进入或询问。" +
                 "不要再点搜索图标，不要直接调用 tap_screen，不要报告完成。"
         VisualStage.VERIFY_CONVERSATION ->
             "必须确认已离开搜索页，画面不再显示联系人、群聊或聊天记录结果分区；" +
