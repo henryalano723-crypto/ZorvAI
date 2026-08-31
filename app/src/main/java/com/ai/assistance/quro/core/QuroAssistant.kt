@@ -18,6 +18,7 @@ import org.json.JSONObject
 import android.util.Log
 import com.ai.assistance.quro.core.QuroToolSpec
 import com.ai.assistance.quro.core.tools.QuroToolRouter
+import com.ai.assistance.quro.core.tools.SendMessageInAppTool
 import java.util.IdentityHashMap
 import com.ai.assistance.quro.core.agent.QuroAgentTrace
 import com.ai.assistance.quro.util.QuroDiag
@@ -243,7 +244,9 @@ class QuroAssistant(
             // send/reply/forward a message, search is merely a child step and must never consume
             // the whole task. This guard is deliberately semantic and precedes the search compiler.
             val compiledMessageIntent = AppMessageIntentCompiler.parse(currentUserRequest)
-            val messageSendIntent = AppMessageIntentCompiler.hasExplicitSend(currentUserRequest)
+            val pendingContactChoiceCall = SendMessageInAppTool.pendingContactChoiceCall(currentUserRequest)
+            val messageSendIntent = pendingContactChoiceCall != null ||
+                AppMessageIntentCompiler.hasExplicitSend(currentUserRequest)
             val appSearchIntent = currentUserRequest
                 .takeUnless { messageSendIntent }
                 ?.let(AppSearchIntentCompiler::parse)
@@ -560,12 +563,18 @@ class QuroAssistant(
                         // tool_calls 各 id 不可重复，tool 结果消息的 tool_call_id 须回指原 call）。
                         // 旧实现把整轮所有 call 都 copy 成同一个 callId → id 撞车、结果对不上，
                         // 导致模型一次性吐多个工具时整轮错乱，只能退化成「一轮一个」。
-                        val messageRewrittenCalls = AppMessageIntentCompiler.rewriteFirstStep(
-                            calls = result.calls,
-                            intent = compiledMessageIntent,
-                            alreadyDispatched = messageTransactionDispatched,
-                            searchResultsReady = messageSearchResultsReady,
-                        )
+                        val messageRewrittenCalls = if (
+                            pendingContactChoiceCall != null && !messageTransactionDispatched
+                        ) {
+                            listOf(pendingContactChoiceCall)
+                        } else {
+                            AppMessageIntentCompiler.rewriteFirstStep(
+                                calls = result.calls,
+                                intent = compiledMessageIntent,
+                                alreadyDispatched = messageTransactionDispatched,
+                                searchResultsReady = messageSearchResultsReady,
+                            )
+                        }
                         if (messageRewrittenCalls.any { it.name == "send_message_in_app" }) {
                             messageTransactionDispatched = true
                         }

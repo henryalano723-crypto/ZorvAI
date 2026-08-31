@@ -11,7 +11,9 @@ import android.util.Base64
 import android.util.Log
 import android.view.Display
 import android.view.accessibility.AccessibilityNodeInfo
+import com.ai.assistance.quro.core.privilege.QuroShizukuBridge
 import com.ai.assistance.quro.service.QuroAccessibilityService
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -51,8 +53,13 @@ class ScreenshotTool : QuroTool {
     override fun run(context: Context, arguments: String): String {
         val svc = QuroAccessibilityService.instance
             ?: return "❌ 无障碍服务未连接：请到设置 → 无障碍 → ZorvAI → 开启"
+        val preferShizuku = runCatching { JSONObject(arguments).optBoolean("prefer_shizuku", false) }
+            .getOrDefault(false)
 
         return try {
+            if (preferShizuku) {
+                captureWithShizuku(context)?.let { path -> return "✅ 截图成功: $path" }
+            }
             // 方式1: Android P+ 原生截图
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val screenshot = captureWithAccessibility(svc)
@@ -64,6 +71,14 @@ class ScreenshotTool : QuroTool {
                         screenshot.recycle()
                     }
                 }
+            }
+
+            // Huawei may report screenshot capability while takeScreenshot still returns no
+            // hardware buffer for a custom-drawn external window. Never replace real pixels with
+            // a 100x100 node-tree placeholder: use the already-authorized Shizuku shell to write
+            // a full-resolution PNG into this app's external files directory.
+            captureWithShizuku(context)?.let { path ->
+                return "✅ 截图成功: $path"
             }
 
             // 方式2: 像素级截图（通过View绘制）
@@ -140,6 +155,25 @@ class ScreenshotTool : QuroTool {
             }
         }
     }
+
+    internal fun captureWithShizuku(context: Context): String? = runCatching {
+        val dir = context.getExternalFilesDir("screenshots")?.apply { mkdirs() }
+            ?: return@runCatching null
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val file = File(dir, "screenshot_shell_$timestamp.png")
+        val path = file.absolutePath
+        if (!path.matches(Regex("[A-Za-z0-9_./-]+"))) return@runCatching null
+        val result = QuroShizukuBridge.exec(
+            context,
+            "screencap -p '$path' && chmod 640 '$path' && echo ZORV_SCREENSHOT_OK",
+        )
+        if (!result.contains("ZORV_SCREENSHOT_OK") || !file.isFile || file.length() < 4_096L) {
+            return@runCatching null
+        }
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth < 360 || bounds.outHeight < 640) null else path
+    }.getOrNull()
 
     /**
      * 通过节点树边界生成示意截图（不依赖系统截图API）。
@@ -258,7 +292,9 @@ class VisualAnalysisTool : QuroTool {
         }
 
         val originalPath = result.removePrefix("✅ 截图成功: ")
-        val searchFocused = question.contains("搜索") || question.contains("放大镜")
+        val fullScreenRequired = args.optBoolean("full_screen", false)
+        val searchFocused = !fullScreenRequired &&
+            (question.contains("搜索") || question.contains("放大镜"))
         val path = if (searchFocused) createTopBandCrop(context, originalPath) ?: originalPath else originalPath
 
         // 2. 获取节点树作为辅助信息

@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.provider.Settings
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import com.ai.assistance.quro.core.QuroToolCall
 import com.ai.assistance.quro.core.privilege.QuroShizukuBridge
 import com.ai.assistance.quro.service.QuroAiKeyboardService
 import org.json.JSONObject
@@ -222,6 +223,26 @@ private fun captureAppSurfaceFingerprint(
     }
 }
 
+private fun captureRealAppSurfaceFingerprint(
+    context: Context,
+    service: com.ai.assistance.quro.service.QuroAccessibilityService,
+): IntArray? {
+    val shizukuPath = ScreenshotTool().captureWithShizuku(context)
+    val bitmap = shizukuPath?.let(android.graphics.BitmapFactory::decodeFile)
+    if (bitmap != null) {
+        if (bitmap.width < 360 || bitmap.height < 640) {
+            bitmap.recycle()
+        } else {
+            return try {
+                appSurfaceFingerprint(bitmap)
+            } finally {
+                bitmap.recycle()
+            }
+        }
+    }
+    return captureAppSurfaceFingerprint(service)
+}
+
 private fun appSurfaceFingerprint(bitmap: android.graphics.Bitmap): IntArray {
     val surfaceHeight = (bitmap.height * 0.68f).toInt().coerceIn(1, bitmap.height)
     val surface = android.graphics.Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, surfaceHeight)
@@ -301,7 +322,8 @@ class SendMessageInAppTool : QuroTool {
             "visual_verified":{"type":"boolean","description":"视觉上是否满足该阶段 instruction 的全部精确条件；不确定必须 false"},
             "action_x":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 x；只在 instruction 要求点击时提供"},
             "action_y":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 y；只在 instruction 要求点击时提供"},
-            "candidate_options":{"type":"array","items":{"type":"string"},"description":"select_contact 阶段发现多个联系人精确匹配时，返回画面可见的区分信息；禁止包含群聊或聊天记录"}
+            "candidate_options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"action_x":{"type":"integer"},"action_y":{"type":"integer"}},"required":["label","action_x","action_y"]},"description":"select_contact 阶段发现多个联系人精确匹配时，返回每个联系人可见区分信息及该行中心坐标；禁止包含群聊或聊天记录"},
+            "cancel_contact_choice":{"type":"boolean","description":"用户在候选选择中明确回答都不是或取消时为 true"}
         }
     }"""
 
@@ -324,11 +346,79 @@ class SendMessageInAppTool : QuroTool {
         var stage: VisualStage,
         var screenshotWidth: Int = 0,
         var screenshotHeight: Int = 0,
+        var contactVisualRetries: Int = 0,
+        var pendingContactChoices: List<ContactChoice> = emptyList(),
     )
+
+    private data class ContactChoice(val label: String, val x: Int, val y: Int)
 
     companion object {
         private const val VISUAL_TRANSACTION_TTL_MS = 5 * 60 * 1000L
         private val visualTransactions = ConcurrentHashMap<String, VisualTransaction>()
+
+        /** Continue the newest unresolved contact choice for both typed and transcribed speech. */
+        fun pendingContactChoiceCall(userText: String): QuroToolCall? {
+            pruneExpiredVisualTransactions()
+            val transaction = visualTransactions.values
+                .filter { it.stage == VisualStage.SELECT_CONTACT && it.pendingContactChoices.isNotEmpty() }
+                .maxByOrNull { it.createdAtMs }
+                ?: return null
+            val normalized = userText.trim().trim('，', ',', '。', '.', '！', '!', '？', '?')
+            val displayedCancelNumber = transaction.pendingContactChoices.size + 1
+            val numericAnswer = Regex("^(?:选(?:择)?\\s*)?(\\d+)(?:号|个)?$")
+                .matchEntire(normalized)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val cancel = normalized in setOf("都不是", "都不对", "取消", "取消发送", "没有", "无") ||
+                numericAnswer == displayedCancelNumber
+            val selectedIndex = if (cancel) null else parseContactChoiceIndex(
+                normalized,
+                transaction.pendingContactChoices.map { it.label },
+            )
+            if (!cancel && selectedIndex == null) return null
+            return QuroToolCall(
+                name = "send_message_in_app",
+                arguments = JSONObject()
+                    .put("transaction_id", transaction.id)
+                    .put("resume_stage", transaction.stage.wire)
+                    .put("visual_verified", !cancel)
+                    .put("cancel_contact_choice", cancel)
+                    .apply {
+                        selectedIndex?.let { index ->
+                            val choice = transaction.pendingContactChoices[index]
+                            put("action_x", choice.x)
+                            put("action_y", choice.y)
+                        }
+                    }
+                    .toString(),
+            )
+        }
+
+        internal fun parseContactChoiceIndex(userText: String, labels: List<String>): Int? {
+            val text = userText.trim().lowercase().removePrefix("选择").removePrefix("选").trim()
+            val number = Regex("^(?:第)?(\\d+)(?:号|个)?$")
+                .matchEntire(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            if (number != null && number in 1..labels.size) return number - 1
+            val ordinal = mapOf(
+                "一" to 0, "第一" to 0, "第一个" to 0, "第一个人" to 0,
+                "二" to 1, "第二" to 1, "第二个" to 1, "第二个人" to 1,
+                "三" to 2, "第三" to 2, "第三个" to 2, "第三个人" to 2,
+                "四" to 3, "第四" to 3, "第四个" to 3, "第四个人" to 3,
+                "五" to 4, "第五" to 4, "第五个" to 4, "第五个人" to 4,
+                "六" to 5, "第六" to 5, "第六个" to 5, "第六个人" to 5,
+                "七" to 6, "第七" to 6, "第七个" to 6, "第七个人" to 6,
+                "八" to 7, "第八" to 7, "第八个" to 7, "第八个人" to 7,
+            )[text]
+            if (ordinal != null && ordinal in labels.indices) return ordinal
+            val exactMatches = labels.indices.filter { labels[it].trim().equals(userText.trim(), ignoreCase = true) }
+            return exactMatches.singleOrNull()
+        }
+
+        private fun pruneExpiredVisualTransactions() {
+            val cutoff = System.currentTimeMillis() - VISUAL_TRANSACTION_TTL_MS
+            visualTransactions.entries
+                .filter { it.value.createdAtMs < cutoff }
+                .map { it.key }
+                .forEach(visualTransactions::remove)
+        }
     }
 
     override fun run(context: Context, arguments: String): String {
@@ -648,20 +738,40 @@ class SendMessageInAppTool : QuroTool {
         if (requestedStage != transaction.stage.wire) {
             return "❌ [消息事务阶段不匹配] 当前必须处理 ${transaction.stage.wire}，拒绝跳步"
         }
+        if (args.optBoolean("cancel_contact_choice", false)) {
+            visualTransactions.remove(transactionId)
+            return "✅ [MESSAGE_CONTACT_CHOICE_CANCELLED] 已取消本次联系人选择，未输入或发送消息"
+        }
         if (!args.optBoolean("visual_verified", false)) {
             if (transaction.stage == VisualStage.SELECT_CONTACT) {
                 val options = args.optJSONArray("candidate_options")?.let { array ->
                     (0 until array.length()).mapNotNull { index ->
-                        array.optString(index).trim().takeIf { it.isNotEmpty() }
-                    }.distinct().take(8)
+                        val item = array.optJSONObject(index) ?: return@mapNotNull null
+                        val label = item.optString("label").trim()
+                        val x = item.optInt("action_x", -1)
+                        val y = item.optInt("action_y", -1)
+                        ContactChoice(label, x, y).takeIf {
+                            label.isNotEmpty() && x in 0 until transaction.screenshotWidth &&
+                                y in 0 until transaction.screenshotHeight
+                        }
+                    }.distinctBy { Triple(it.label, it.x, it.y) }.take(8)
                 }.orEmpty()
-                if (options.size >= 2) {
-                    visualTransactions.remove(transactionId)
+                if (options.isNotEmpty()) {
+                    transaction.pendingContactChoices = options
                     return buildString {
                         append("⚠️ [MESSAGE_CONTACT_CHOICE_REQUIRED] 找到多个联系人“${transaction.contact}”，请选择：\n")
-                        options.forEachIndexed { index, option -> append("${index + 1}. $option\n") }
+                        options.forEachIndexed { index, option -> append("${index + 1}. ${option.label}\n") }
                         append("${options.size + 1}. 都不是")
                     }
+                }
+                if (transaction.contactVisualRetries < 1) {
+                    transaction.contactVisualRetries += 1
+                    return captureVisualStage(
+                        context,
+                        transaction,
+                        "上一张图未能唯一确认联系人。请重新只检查‘联系人’分区：" +
+                            "若有一个精确结果则返回坐标；若有多个则必须用 candidate_options 列出可见区分信息。",
+                    )
                 }
             }
             visualTransactions.remove(transactionId)
@@ -701,12 +811,13 @@ class SendMessageInAppTool : QuroTool {
             }
             VisualStage.SELECT_CONTACT -> {
                 val point = requiredVisualPoint(args, transaction) ?: return "❌ [选择联系人] 缺少唯一目标的有效中心坐标"
-                val beforeConversation = captureAppSurfaceFingerprint(svc)
+                transaction.pendingContactChoices = emptyList()
+                val beforeConversation = captureRealAppSurfaceFingerprint(context, svc)
                     ?: return "❌ [选择联系人] 点击前无法建立目标页面验证基线，禁止继续"
                 if (!dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())) {
                     return "❌ [选择联系人] 点击动作未能派发"
                 }
-                if (!waitForStableAppSurfaceChange(svc, beforeConversation)) {
+                if (!waitForStableAppSurfaceChange(context, svc, beforeConversation)) {
                     return captureVisualStage(
                         context,
                         transaction,
@@ -770,7 +881,11 @@ class SendMessageInAppTool : QuroTool {
         val question = listOfNotNull(retryNotice, stageQuestion).joinToString(" ")
         val captured = VisualAnalysisTool().run(
             context,
-            JSONObject().put("question", question).toString(),
+            JSONObject()
+                .put("question", question)
+                .put("full_screen", transaction.stage != VisualStage.VERIFY_SEARCH_FIELD)
+                .put("prefer_shizuku", true)
+                .toString(),
         )
         val json = runCatching { JSONObject(captured) }.getOrNull()
             ?: return "❌ [截图核对联系人] $captured"
@@ -779,9 +894,9 @@ class SendMessageInAppTool : QuroTool {
         }
         transaction.screenshotWidth = json.optInt("width", 0)
         transaction.screenshotHeight = json.optInt("height", 0)
-        if (transaction.screenshotWidth <= 0 || transaction.screenshotHeight <= 0) {
+        if (transaction.screenshotWidth < 360 || transaction.screenshotHeight < 640) {
             visualTransactions.remove(transaction.id)
-            return "❌ [截图核对] 截图尺寸无效，消息事务已安全终止"
+            return "❌ [截图核对] 未取得真实屏幕像素（尺寸过小），消息事务已安全终止"
         }
         return json.apply {
             put("status", "needs_visual")
@@ -800,13 +915,14 @@ class SendMessageInAppTool : QuroTool {
     }
 
     private fun waitForStableAppSurfaceChange(
+        context: Context,
         svc: com.ai.assistance.quro.service.QuroAccessibilityService,
         before: IntArray,
     ): Boolean {
         var consecutiveChangedFrames = 0
         repeat(10) {
             Thread.sleep(250)
-            val after = captureAppSurfaceFingerprint(svc)
+            val after = captureRealAppSurfaceFingerprint(context, svc)
             if (after != null && visualFingerprintsDiffer(before, after)) {
                 consecutiveChangedFrames += 1
                 if (consecutiveChangedFrames >= 2) return true
@@ -826,7 +942,7 @@ class SendMessageInAppTool : QuroTool {
             "只检查‘联系人’分区，禁止把群聊名称、群聊成员命中或聊天记录正文当作联系人。" +
                 "只有联系人分区中恰好一个结果的可见名称与“${transaction.contact}”完全一致时，才调用 send_message_in_app，" +
                 "原样回传 transaction_id、resume_stage=select_contact、visual_verified=true 和该结果中心 action_x/action_y。" +
-                "若联系人分区有多个精确同名联系人，visual_verified=false，并用 candidate_options 返回每个候选在画面可见的备注/微信号尾号/地区等区分信息；" +
+                "若联系人分区有多个精确同名联系人，visual_verified=false，并用 candidate_options 返回每个候选在画面可见的备注/微信号尾号/地区等区分信息，以及该联系人行中心 action_x/action_y；" +
                 "不要再点搜索图标，不要直接调用 tap_screen，不要报告完成。"
         VisualStage.VERIFY_CONVERSATION ->
             "必须确认已离开搜索页，画面不再显示联系人、群聊或聊天记录结果分区；" +
@@ -854,14 +970,6 @@ class SendMessageInAppTool : QuroTool {
         } else {
             null
         }
-    }
-
-    private fun pruneExpiredVisualTransactions() {
-        val cutoff = System.currentTimeMillis() - VISUAL_TRANSACTION_TTL_MS
-        visualTransactions.entries
-            .filter { it.value.createdAtMs < cutoff }
-            .map { it.key }
-            .forEach(visualTransactions::remove)
     }
 
     private fun findOrOpenSearchEditor(
