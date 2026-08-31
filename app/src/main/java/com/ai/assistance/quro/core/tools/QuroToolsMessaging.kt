@@ -894,6 +894,13 @@ class SendMessageInAppTool : QuroTool {
         transaction: VisualTransaction,
         retryNotice: String? = null,
     ): String {
+        val service = com.ai.assistance.quro.service.QuroAccessibilityService.instance
+            ?: return "❌ 无障碍服务未连接"
+        val activeTarget = ExternalUiTargetSession.rootForAutomation(service)
+            ?: return "❌ [截图核对] 无法稳定恢复目标应用窗口"
+        if (activeTarget.packageName?.toString() != transaction.targetPackage) {
+            return "❌ [截图核对] 当前活动窗口不属于目标应用，已停止"
+        }
         val stageQuestion = when (transaction.stage) {
             VisualStage.VERIFY_SEARCH_FIELD ->
                 "确认当前目标应用已进入全局搜索页，并定位顶部唯一搜索输入框中心；不要定位联系人结果或消息输入框"
@@ -907,14 +914,21 @@ class SendMessageInAppTool : QuroTool {
                 "核对发送后输入框已经清空，并且当前会话中出现与用户原始正文逐字一致的新消息"
         }
         val question = listOfNotNull(retryNotice, stageQuestion).joinToString(" ")
-        val captured = VisualAnalysisTool().run(
-            context,
-            JSONObject()
-                .put("question", question)
-                .put("full_screen", transaction.stage != VisualStage.VERIFY_SEARCH_FIELD)
-                .put("prefer_shizuku", true)
-                .toString(),
-        )
+        val captured = try {
+            VisualAnalysisTool().run(
+                context,
+                JSONObject()
+                    .put("question", question)
+                    .put("full_screen", transaction.stage != VisualStage.VERIFY_SEARCH_FIELD)
+                    .put("prefer_shizuku", true)
+                    .toString(),
+            )
+        } finally {
+            // Visual reasoning is a potentially slow network/model round. Keep Zorv foreground on
+            // aggressive OEM power managers; the next tool continuation will restore the exact
+            // external task again before touching it.
+            ExternalUiTargetSession.returnToOwnApp(service)
+        }
         val json = runCatching { JSONObject(captured) }.getOrNull()
             ?: return "❌ [截图核对联系人] $captured"
         if (!json.optBoolean("attach_to_next_model", false)) {

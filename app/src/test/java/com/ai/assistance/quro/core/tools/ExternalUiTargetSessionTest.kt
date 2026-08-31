@@ -47,6 +47,50 @@ class ExternalUiTargetSessionTest {
     }
 
     @Test
+    fun awaitStableSurface_requiresConsecutiveActiveTargetSamples() {
+        val target1 = Any()
+        val own = Any()
+        val target2 = Any()
+        val target3 = Any()
+        val packages = mapOf(
+            target1 to "chat.vendor",
+            own to "com.ai.assistance.quro",
+            target2 to "chat.vendor",
+            target3 to "chat.vendor",
+        )
+        val remaining = mutableListOf(own, target2, target3)
+
+        val actual = ExternalUiTargetSession.awaitStableSurface(
+            initial = target1,
+            expectedPackage = "chat.vendor",
+            attempts = 4,
+            requiredConsecutive = 2,
+            packageOf = { packages[it] },
+            next = { remaining.removeAt(0) },
+        )
+
+        assertSame(target3, actual)
+    }
+
+    @Test
+    fun awaitStableSurface_rejectsSingleStaleTargetRoot() {
+        val staleTarget = Any()
+        val own = Any()
+        val remaining = mutableListOf(own, own)
+
+        val actual = ExternalUiTargetSession.awaitStableSurface(
+            initial = staleTarget,
+            expectedPackage = "chat.vendor",
+            attempts = 3,
+            requiredConsecutive = 2,
+            packageOf = { if (it === staleTarget) "chat.vendor" else "com.ai.assistance.quro" },
+            next = { remaining.removeAt(0) },
+        )
+
+        assertNull(actual)
+    }
+
+    @Test
     fun parseTaskIdentity_returnsExactTargetTaskInsteadOfMostRecentTask() {
         val dump = """
             * Recent #0: Task{aaa #500 type=standard A=100:example.other U=0}

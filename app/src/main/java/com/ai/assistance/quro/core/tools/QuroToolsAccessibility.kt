@@ -29,8 +29,9 @@ internal object ExternalUiTargetSession {
     private const val TAG = "ExternalUiTargetSession"
     private const val PREFS = "external_ui_target"
     private const val MAX_AGE_MS = 15 * 60 * 1000L
-    private const val FOREGROUND_SETTLE_ATTEMPTS = 8
+    private const val FOREGROUND_SETTLE_ATTEMPTS = 12
     private const val FOREGROUND_SETTLE_DELAY_MS = 125L
+    private const val FOREGROUND_STABLE_SAMPLES = 2
 
     fun remember(context: Context, packageName: String) {
         if (packageName.isBlank() || packageName == context.packageName) return
@@ -82,25 +83,63 @@ internal object ExternalUiTargetSession {
         return null
     }
 
+    internal fun <T> awaitStableSurface(
+        initial: T?,
+        expectedPackage: String,
+        attempts: Int,
+        requiredConsecutive: Int,
+        packageOf: (T?) -> String?,
+        next: () -> T?,
+    ): T? {
+        var candidate = initial
+        var consecutive = 0
+        repeat(attempts.coerceAtLeast(1)) { attempt ->
+            if (packageOf(candidate) == expectedPackage) {
+                consecutive += 1
+                if (consecutive >= requiredConsecutive.coerceAtLeast(1)) return candidate
+            } else {
+                consecutive = 0
+            }
+            if (attempt + 1 < attempts) candidate = next()
+        }
+        return null
+    }
+
+    private fun awaitStableActiveRoot(
+        service: QuroAccessibilityService,
+        expectedPackage: String,
+        initial: AccessibilityNodeInfo? = service.rootInActiveWindow,
+    ): AccessibilityNodeInfo? = awaitStableSurface(
+        initial = initial,
+        expectedPackage = expectedPackage,
+        attempts = FOREGROUND_SETTLE_ATTEMPTS,
+        requiredConsecutive = FOREGROUND_STABLE_SAMPLES,
+        packageOf = { it?.packageName?.toString() },
+        next = {
+            Thread.sleep(FOREGROUND_SETTLE_DELAY_MS)
+            service.rootInActiveWindow
+        },
+    )
+
     fun rootForAutomation(service: QuroAccessibilityService): AccessibilityNodeInfo? {
         val target = current(service) ?: return service.actionableRoot()
+        // actionableRoot() intentionally remembers an external window for automation, so it can
+        // legally return a stale target root while Zorv is actually foreground. Only the raw active
+        // window may decide whether a task is ready to receive pixels or input.
         val root = awaitTrustedSurface(
-            initial = service.actionableRoot(),
+            initial = service.rootInActiveWindow,
             ownPackage = service.packageName,
             targetPackage = target,
             attempts = FOREGROUND_SETTLE_ATTEMPTS,
             packageOf = { it?.packageName?.toString() },
             next = {
                 Thread.sleep(FOREGROUND_SETTLE_DELAY_MS)
-                service.actionableRoot()
+                service.rootInActiveWindow
             },
         ) ?: return null
         val foreground = root.packageName?.toString()
         if (foreground == target) {
-            // remember() already captures task identity asynchronously. Never issue a synchronous
-            // Shizuku dumpsys on every read/tap/input: a degraded Shizuku UserService can otherwise
-            // hold an already-successful UI action until the caller times out and retries it.
-            return root
+            return awaitStableActiveRoot(service, target, root)
         }
         // Never silently operate on an unrelated external app. The old behaviour accepted any
         // non-Zorv root here, which allowed a stale instruction to click the wrong application.
@@ -111,14 +150,34 @@ internal object ExternalUiTargetSession {
             ?: discoverTask(service, target)?.taskId
             ?: return null
         val activityManager = service.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        runCatching { activityManager.moveTaskToFront(taskId, ActivityManager.MOVE_TASK_WITH_HOME) }
+        // MOVE_TASK_WITH_HOME inserts the launcher behind the restored task and causes visible
+        // returnToHome transitions on Huawei. A plain task promotion is the intended operation.
+        runCatching { activityManager.moveTaskToFront(taskId, 0) }
             .getOrElse { return null }
-        repeat(8) {
-            Thread.sleep(200)
-            val resumed = service.actionableRoot()
-            if (resumed?.packageName?.toString() == target) return resumed
+        return awaitStableActiveRoot(service, target)
+    }
+
+    fun returnToOwnApp(service: QuroAccessibilityService): Boolean {
+        val ownPackage = service.packageName
+        // Do not spend the full settle timeout waiting for Zorv when the target app is plainly
+        // active. Only perform stability sampling when the first raw root already belongs to Zorv.
+        val initial = service.rootInActiveWindow
+        if (initial?.packageName?.toString() == ownPackage) {
+            return awaitStableActiveRoot(service, ownPackage, initial) != null
         }
-        return null
+        val activityManager = service.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val ownTaskId = activityManager.appTasks.firstOrNull()?.taskInfo?.taskId
+        val promoted = ownTaskId != null && runCatching {
+            activityManager.moveTaskToFront(ownTaskId, 0)
+            true
+        }.getOrDefault(false)
+        if (!promoted) {
+            val launchIntent = service.packageManager.getLaunchIntentForPackage(ownPackage)
+                ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                ?: return false
+            if (runCatching { service.startActivity(launchIntent) }.isFailure) return false
+        }
+        return awaitStableActiveRoot(service, ownPackage) != null
     }
 
     internal data class TaskIdentity(val taskId: Int, val topActivity: String)
