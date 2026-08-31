@@ -736,7 +736,23 @@ class SendMessageInAppTool : QuroTool {
             ?: return "❌ [消息事务已失效] transaction_id 不存在或已超过 5 分钟；禁止凭旧截图继续"
         val requestedStage = args.optString("resume_stage").trim()
         if (requestedStage != transaction.stage.wire) {
-            return "❌ [消息事务阶段不匹配] 当前必须处理 ${transaction.stage.wire}，拒绝跳步"
+            // A model may infer the next page from the picture even when the previous click did
+            // not actually leave the search page. Discard coordinates whose stage meaning is
+            // wrong, but keep the transaction alive and attach authoritative current evidence.
+            val service = com.ai.assistance.quro.service.QuroAccessibilityService.instance
+                ?: return "❌ 无障碍服务未连接"
+            val currentRoot = ExternalUiTargetSession.rootForAutomation(service)
+                ?: return "❌ [恢复消息事务] 无法获得目标应用窗口"
+            if (currentRoot.packageName?.toString() != transaction.targetPackage) {
+                visualTransactions.remove(transactionId)
+                return "❌ [恢复消息事务] 前台应用已经变化，事务已安全终止"
+            }
+            return captureVisualStage(
+                context,
+                transaction,
+                "上一调用回传 resume_stage=$requestedStage，但事务实际仍为 ${transaction.stage.wire}；" +
+                    "已丢弃上一坐标。只按当前截图和当前阶段重新核对，禁止猜测已经进入下一页。",
+            )
         }
         if (args.optBoolean("cancel_contact_choice", false)) {
             visualTransactions.remove(transactionId)
@@ -814,7 +830,19 @@ class SendMessageInAppTool : QuroTool {
                 transaction.pendingContactChoices = emptyList()
                 val beforeConversation = captureRealAppSurfaceFingerprint(context, svc)
                     ?: return "❌ [选择联系人] 点击前无法建立目标页面验证基线，禁止继续"
-                if (!dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())) {
+                // WeChat's FTS surface may accept dispatchGesture() while performing no click.
+                // Once an exact bounded candidate is selected, use the authorized shell input
+                // channel first; accessibility remains the no-privilege fallback.
+                val shizukuClick = QuroShizukuBridge.exec(
+                    context,
+                    "input tap ${point.first} ${point.second} && echo ZORV_CONTACT_TAP_OK",
+                )
+                val clickDispatched = if (!shizukuClick.contains("ZORV_CONTACT_TAP_OK")) {
+                    dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())
+                } else {
+                    true
+                }
+                if (!clickDispatched) {
                     return "❌ [选择联系人] 点击动作未能派发"
                 }
                 if (!waitForStableAppSurfaceChange(context, svc, beforeConversation)) {
