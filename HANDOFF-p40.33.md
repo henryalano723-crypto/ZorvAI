@@ -1,0 +1,122 @@
+# ZorvAI P40 通用控制修复：p40.33 工作交接
+
+更新时间：2026-08-31
+
+## 工作现场
+
+- 设备：`VEG0220924009874 / p40.30`
+- 系统：华为 P40，HarmonyOS 4.2 / EMUI 14.2 兼容环境，Android 12 API 31
+- 后续唯一工作目录：`E:\LocalAI\.zorvai-v1.16-p40-p40.33`
+- 基线提交：`83712d62eb04e445be49797d56bfd9c5cd46cbb2`
+- 当前安装版本：`1.16-p40.32 (2026082928)`
+- 当前工作树为 detached HEAD；完成后用明确 refspec 推送到 `origin/fix/v1.16-p40`。
+
+不要修改旧目录 `E:\LocalAI\.zorvai-v1.16-p40`。它停在较早提交 `41f6bd2`，还保留多项未提交/未跟踪修改，不能 reset、覆盖或粗暴复制。
+
+C 盘的 `...\work\p40.31-build-openssl` 只是此前为保护旧 E 盘脏工作区创建的干净副本；p40.33 已迁回上述 E 盘新工作树。
+
+## 最新真机事实
+
+用户后来那次完整发送指令是用户手动发出的，不是 Zorv 自动续跑。Zorv 正确解析联系人“灵儿”并调用 `send_message_in_app`，但微信停在 `com.tencent.mm.plugin.fts.ui.FTSMainUI`，搜索框始终为空。本次失败提前到了“搜索框聚焦/填写联系人”阶段。
+
+该页面是自绘页面：截图能看到搜索框，但节点树只有空根节点。不要只继续修联系人点击。
+
+禁止用 `uiautomator dump` 做在线诊断；它会在这台鸿蒙 P40 上触发无障碍服务解绑再重绑，污染现场。只使用截图、Zorv 日志及无干扰系统状态检查。
+
+Zorv Agent IME 已启用：`com.ai.assistance.quro/.service.QuroAiKeyboardService`；默认输入法仍是讯飞。因此当前更像没有可靠建立真实焦点或输入降级链未完成，不是 Agent IME 未授权。
+
+鸿蒙 `com.huawei.hiai/.accessibility.VanAccessibilityService` 会自动加入并绑定，可能竞争，但证据不足时不能直接定罪。
+
+## p40.32 已完成
+
+- 真实前台只信任原始 `rootInActiveWindow`，不让陈旧 `actionableRoot` 决定窗口身份。
+- 要求连续两次获得目标应用根窗口。
+- 使用 `moveTaskToFront(taskId, 0)` 恢复任务，不再使用 `MOVE_TASK_WITH_HOME`。
+- 截图后恢复 Zorv 前台，降低鸿蒙在模型/网络等待期间休眠 Zorv 的概率。
+- 联系人选择已改为 Shizuku `input tap` 优先、无障碍备用，并验证点击后页面稳定变化。
+- 模型回错 `resume_stage` 时丢弃旧坐标、恢复目标应用、重新截图，不再直接终止事务。
+
+正式构建 run：`33392036363`。APK：
+
+`C:\Users\admin\Documents\Codex\2026-08-31\zorvai-p40-e-localai-zorvai-v1\outputs\ZorvAI-v1.16-p40.32-run33392036363\app-full-release.apk`
+
+APK SHA-256：`A949E55837C396842734905680FA8C7BF5908FE184DA0825EFFF9BC845C7F350`
+
+签名证书 SHA-256：`7bb02d764febd05e0fca9d7256f90bb17e268def0de0af52a2d13830516aad24`
+
+## 用户要求 p40.33 本轮全部完成
+
+1. 搜索框点击改为 Shizuku 优先。
+2. 验证真实焦点后才输入。
+3. Agent IME 输入后必须回读。
+4. 截图和坐标绑定页面版本。
+5. 失败只允许一次备用通道，然后重新观察。
+6. XML 有效时使用结构化节点。
+7. XML 为空时自动切换截图视觉。
+8. 点击、输入、滑动共用统一验证策略。
+9. 成功路径可以缓存，但每次必须重新核验。
+10. 不写微信专用逻辑，不增加平行路径。
+
+统一目标：
+
+`XML/节点树 + 截图双通道观察 → 带版本目标 → 选择执行通道 → 动作 → 稳定验证 → 成功继续或重新观察`
+
+设计参考只取长处：Zorv 的原生工具/Shizuku/事务安全；Zafiro 的带版本目标；MobileClaw 的截图视觉/SoM/坐标映射；Neuron 的观察→计划→动作→验证→有限重规划。
+
+## 已审计出的缺口
+
+文件：`app/src/main/java/com/ai/assistance/quro/core/tools/QuroToolsMessaging.kt`
+
+- `SELECT_CONTACT` 已使用 Shizuku 点击优先。
+- `VERIFY_SEARCH_FIELD`、`VERIFY_CONVERSATION`、`VERIFY_DRAFT` 仍直接调用 `dispatchPointClick`。
+- 坐标目前只校验截图尺寸范围，没有校验属于哪一版截图。
+- `PasteFocusedTextTool` 已有 Agent IME、InputConnection 检查和视觉变化要求，但没有接入统一聚焦/备用通道执行器。
+- 通用 `tap_screen` 有节点/视觉验证；`swipe_screen` 仍主要把手势派发当作结果。
+
+## 当前半成品修改
+
+尚未编译、测试或提交：
+
+1. 新增 `app/src/main/java/com/ai/assistance/quro/core/tools/VerifiedUiActionExecutor.kt`，目前只是骨架，包含：
+   - `SHIZUKU` / `ACCESSIBILITY` 路由。
+   - `SAFE_TO_REPEAT` / `DISPATCH_ONCE` 风险等级。
+   - 最多一次备用路由。
+   - 成功路由缓存，但每次仍运行验证。
+   - 页面版本/坐标范围检查与连续稳定变化判断。
+2. `QuroToolsMessaging.kt` 只新增了：工具参数 `observation_version`、事务字段 `observationVersion`、联系人编号回复回传当前版本。
+
+仍需完成：
+
+- `captureVisualStage()` 生成单调递增观察版本并写入 JSON。
+- `resumeVisualTransaction()` 拒绝缺失/过期版本并重新截图。
+- `requiredVisualPoint()` 接入版本校验。
+- 全部视觉点击阶段接入统一执行器。
+- 搜索框/消息框先证明目标 InputConnection，再且只输入一次。
+- 输入后截图回读；不确定状态禁止再次输入。
+- `tap_screen` / `swipe_screen` 接入共同稳定验证策略。
+- 双通道观察模式和成功路由缓存落地。
+- 补齐单元测试。
+
+当前预期 `git status --short`：
+
+```text
+ M app/src/main/java/com/ai/assistance/quro/core/tools/QuroToolsMessaging.kt
+?? app/src/main/java/com/ai/assistance/quro/core/tools/VerifiedUiActionExecutor.kt
+?? HANDOFF-p40.33.md
+```
+
+## 安全与发布约束
+
+- 动作“已派发”不等于执行成功，必须通过节点、视觉或语义结果验证。
+- 聚焦等幂等动作可在未验证时使用一个备用通道。
+- 发送、删除、支付等不可逆动作派发后结果不确定时绝不换通道重试，必须重新观察。
+- Agent IME 在证明目标应用存在 InputConnection 前禁止输入。
+- `commitText` 已成功但回读不明时，禁止再次输入。
+- 缓存只能保存上次成功的执行通道，不能缓存坐标或成功结论。
+- 不运行 `uiautomator dump`。
+
+至少补充并通过：页面版本、过期坐标、备用通道上限、不可逆动作不重试、成功路由仍重新验证、连续两帧变化、XML/截图模式、焦点和单次输入测试；保留原有联系人编号/语音序号/“都不是”和 `ExternalUiTargetSessionTest`；最后执行 `git diff --check`。
+
+建议版本：`1.16-p40.33`，versionCode 在 `2026082928` 基础上递增一次。
+
+本地测试全部通过后才提交推送。只触发一次 `build-patched-apk.yml` 正式构建；成功后核对固定签名并覆盖安装，不得为试错重复触发 GitHub 编译。

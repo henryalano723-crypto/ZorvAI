@@ -27,7 +27,7 @@ internal object AppMessageIntentCompiler {
     )
 
     private val explicitSend = Regex(
-        "(?:发送(?:消息|信息)?|发出|发消息|发信息|发给|给.{1,40}?发|(?:打开|去|在|用).{1,30}?(?:跟|对).{1,40}?说|点击发送|按发送|回复|转发|send\\s+(?:a\\s+)?message)",
+        "(?:发送(?:消息|信息)?|发出|发消息|发信息|发给|给.{1,40}?发|(?:搜索|搜|查找).{1,40}?(?:然后|并|再)?发|(?:打开|去|在|用).{1,30}?(?:跟|对).{1,40}?说|点击发送|按发送|回复|转发|send\\s+(?:a\\s+)?message)",
         RegexOption.IGNORE_CASE,
     )
     private val searchWord = Regex("(?:搜索|搜|查找)")
@@ -59,6 +59,26 @@ internal object AppMessageIntentCompiler {
     fun parse(userText: String): Intent? {
         val text = userText.trim()
         if (!hasExplicitSend(text)) return null
+        // Prefer the explicit search -> input -> send grammar before the broader natural
+        // search/send grammar. Otherwise the latter can swallow “然后输入…” into the contact.
+        val structuredSearch = searchWord.find(text)
+        val structuredInput = structuredSearch?.let { inputWord.find(text, it.range.last + 1) }
+        if (structuredSearch != null && structuredInput != null) {
+            val rawApp = text.substring(0, structuredSearch.range.first)
+                .trim().removePrefix("打开").removePrefix("去").removePrefix("在").trim()
+                .removeSuffix("点击").trimEnd('里', '中', '内').trim()
+            val contact = text.substring(structuredSearch.range.last + 1, structuredInput.range.first)
+                .trim().trim('，', ',', '。', '.', '！', '!', '“', '”', '"', '\'')
+            val afterInput = text.substring(structuredInput.range.last + 1).trim()
+            val sendSuffix = trailingSend.find(afterInput)
+            val message = sendSuffix?.let {
+                afterInput.substring(0, it.range.first)
+                    .trim().trim('，', ',', '。', '.', '！', '!', '“', '”', '"', '\'')
+            }.orEmpty()
+            if (rawApp.isNotEmpty() && contact.isNotEmpty() && message.isNotEmpty()) {
+                return Intent(rawApp, contact, message, confirmSend = true)
+            }
+        }
         directSend.matchEntire(text)?.let { match ->
             val app = match.groupValues[1].trim().trimEnd('里', '中', '内').trim()
             val contact = match.groupValues[2].trim().trim('，', ',', '。', '.', '！', '!', '“', '”', '"', '\'')

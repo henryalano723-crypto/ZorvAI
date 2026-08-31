@@ -274,6 +274,27 @@ internal fun visualFingerprintsDiffer(before: IntArray, after: IntArray): Boolea
     return changed >= before.size / 20 || totalDelta >= before.size * 5L
 }
 
+private fun waitForStableSurfaceChange(
+    svc: QuroAccessibilityService,
+    beforePage: Int,
+    beforeVisual: IntArray?,
+): Boolean {
+    val samples = mutableListOf<Boolean>()
+    repeat(10) {
+        Thread.sleep(250)
+        val root = ExternalUiTargetSession.rootForAutomation(svc)
+        val nodeChanged = root != null && root.packageName?.toString() != svc.packageName &&
+            compactUiFingerprint(root) != beforePage
+        val visualChanged = beforeVisual != null && ScreenshotTool().captureWithAccessibility(svc)?.let { bitmap ->
+            try { visualFingerprintsDiffer(beforeVisual, visualFingerprint(bitmap)) }
+            finally { bitmap.recycle() }
+        } == true
+        samples += nodeChanged || visualChanged
+        if (VerifiedUiActionExecutor.hasStableChange(samples)) return true
+    }
+    return false
+}
+
 /**
  * L1 无障碍屏幕控制与感知工具集（CapOS 通道）。
  *
@@ -528,15 +549,15 @@ class TapScreenTool : QuroTool {
                 args.has("x") && args.has("y") -> {
                     val x = args.getDouble("x").toFloat()
                     val y = args.getDouble("y").toFloat()
-                    clickAt(svc, x, y)
+                    clickAt(context, svc, x, y)
                 }
                 args.has("text") -> {
                     val text = args.getString("text")!!
-                    findAndClick(svc, byText = text)
+                    findAndClick(context, svc, byText = text)
                 }
                 args.has("description") -> {
                     val desc = args.getString("description")!!
-                    findAndClick(svc, byDesc = desc)
+                    findAndClick(context, svc, byDesc = desc)
                 }
                 else -> "❌ 缺少参数：需要 x+y / text / description 任一"
             }
@@ -545,7 +566,7 @@ class TapScreenTool : QuroTool {
         }
     }
 
-    private fun clickAt(svc: QuroAccessibilityService, x: Float, y: Float): String {
+    private fun clickAt(context: Context, svc: QuroAccessibilityService, x: Float, y: Float): String {
         // 坐标越界保护：派发到屏幕外的手势在高版本可能返回 true 却什么都不做（语义成功≠执行成功）
         val (screenWidth, screenHeight) = physicalDisplaySize(svc)
         if (x < 0 || y < 0 || x >= screenWidth || y >= screenHeight)
@@ -567,20 +588,23 @@ class TapScreenTool : QuroTool {
             (it.text?.toString() ?: it.contentDescription?.toString()
                 ?: it.className?.toString()?.substringAfterLast(".") ?: "节点")
         } ?: "坐标(${x.toInt()},${y.toInt()})"
-        val dispatched = tapGestureAt(svc, x, y)
-        return if (dispatched) {
-            val target = hit?.let { findClickableAncestor(it) } ?: hit
-            if (target?.isCheckable == true) verifyToggle(svc, x, y, target.isChecked)
-            else verifyPageChange(svc, beforePage, beforeVisual, label)
-        } else {
-            // 手势被拒：降级到 performAction（不认坐标，只能点元素本身）
-            val target = hit?.let { findClickableAncestor(it) } ?: hit
-            if (target != null) {
-                val ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                if (ok) verifyPageChange(svc, beforePage, beforeVisual, label)
-                else "❌ 点击「$label」失败（手势与 performAction 均被拒，可能 UI 未就绪）"
-            } else "❌ 轻触手势被系统拒绝派发且坐标处无节点"
-        }
+        val result = VerifiedUiActionExecutor.execute(
+            cacheKey = "tap_coordinate",
+            retrySafety = VerifiedUiActionExecutor.RetrySafety.SAFE_TO_REPEAT,
+            dispatch = { route ->
+                when (route) {
+                    VerifiedUiActionExecutor.Route.SHIZUKU -> QuroShizukuBridge.exec(
+                        context,
+                        "input tap ${x.toInt()} ${y.toInt()} && echo ZORV_UI_ACTION_OK",
+                    ).contains("ZORV_UI_ACTION_OK")
+                    VerifiedUiActionExecutor.Route.ACCESSIBILITY -> tapGestureAt(svc, x, y)
+                }
+            },
+            verify = { waitForStableSurfaceChange(svc, beforePage, beforeVisual) },
+        )
+        return if (result.verified) "✅ 已点击「$label」，连续两帧页面变化已确认"
+        else if (result.uncertainDispatch) "⚠️ 点击最多已尝试一个备用通道，但页面未稳定变化；必须重新观察，禁止复用坐标"
+        else "❌ 点击「$label」未能派发"
     }
 
     /**
@@ -679,7 +703,7 @@ class TapScreenTool : QuroTool {
         return ok.get()
     }
 
-    private fun findAndClick(svc: QuroAccessibilityService, byText: String? = null, byDesc: String? = null): String {
+    private fun findAndClick(context: Context, svc: QuroAccessibilityService, byText: String? = null, byDesc: String? = null): String {
         // 按文本/描述查找（不要求节点本身可点击，因为可点监听常在父容器）；找不到则延迟重试一次（应对页面跳变）
         var root = ExternalUiTargetSession.rootForAutomation(svc)
             ?: return "❌ 无法恢复刚才的目标 App，已停止点击；不会误点 Zorv"
@@ -702,14 +726,24 @@ class TapScreenTool : QuroTool {
         val cx = (r.left + r.right) / 2f
         val cy = (r.top + r.bottom) / 2f
         val label = (target.text?.toString() ?: target.contentDescription?.toString() ?: byText ?: byDesc ?: "节点")
-        val dispatched = tapGestureAt(svc, cx, cy)
-        return if (dispatched) {
-            if (target.isCheckable) verifyToggle(svc, cx, cy, target.isChecked)
-            else verifyPageChange(svc, beforePage, beforeVisual, label)
-        } else {
-            val ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            if (ok) verifyPageChange(svc, beforePage, beforeVisual, label) else "❌ 点击「$label」失败（建议重试）"
-        }
+        val result = VerifiedUiActionExecutor.execute(
+            cacheKey = "tap_structured_node",
+            retrySafety = VerifiedUiActionExecutor.RetrySafety.SAFE_TO_REPEAT,
+            dispatch = { route ->
+                when (route) {
+                    VerifiedUiActionExecutor.Route.SHIZUKU -> QuroShizukuBridge.exec(
+                        context,
+                        "input tap ${cx.toInt()} ${cy.toInt()} && echo ZORV_UI_ACTION_OK",
+                    ).contains("ZORV_UI_ACTION_OK")
+                    VerifiedUiActionExecutor.Route.ACCESSIBILITY ->
+                        target.performAction(AccessibilityNodeInfo.ACTION_CLICK) || tapGestureAt(svc, cx, cy)
+                }
+            },
+            verify = { waitForStableSurfaceChange(svc, beforePage, beforeVisual) },
+        )
+        return if (result.verified) "✅ 已点击「$label」，连续两帧页面变化已确认"
+        else if (result.uncertainDispatch) "⚠️ 点击最多已尝试一个备用通道，但页面未稳定变化；必须重新观察"
+        else "❌ 点击「$label」失败"
     }
 
     private fun findNode(root: AccessibilityNodeInfo, byText: String?, byDesc: String?, depth: Int): AccessibilityNodeInfo? {
@@ -870,7 +904,33 @@ class SwipeScreenTool : QuroTool {
                     else -> Quadruple(w / 2f, h * 0.7f, w / 2f, h * 0.3f)  // 上滑(默认)
                 }
             }
-            dispatchSwipe(svc, sx, sy, ex, ey, duration)
+            if (listOf(sx, ex).any { it < 0 || it >= w } || listOf(sy, ey).any { it < 0 || it >= h }) {
+                return "❌ 滑动坐标越界(物理屏幕 ${screenWidth}×${screenHeight})"
+            }
+            val root = ExternalUiTargetSession.rootForAutomation(svc)
+                ?: return "❌ 无法恢复目标 App，拒绝滑动"
+            val beforePage = compactUiFingerprint(root)
+            val beforeVisual = ScreenshotTool().captureWithAccessibility(svc)?.let { bitmap ->
+                try { visualFingerprint(bitmap) } finally { bitmap.recycle() }
+            }
+            val result = VerifiedUiActionExecutor.execute(
+                cacheKey = "swipe_screen",
+                retrySafety = VerifiedUiActionExecutor.RetrySafety.SAFE_TO_REPEAT,
+                dispatch = { route ->
+                    when (route) {
+                        VerifiedUiActionExecutor.Route.SHIZUKU -> QuroShizukuBridge.exec(
+                            context,
+                            "input swipe ${sx.toInt()} ${sy.toInt()} ${ex.toInt()} ${ey.toInt()} $duration && echo ZORV_UI_ACTION_OK",
+                        ).contains("ZORV_UI_ACTION_OK")
+                        VerifiedUiActionExecutor.Route.ACCESSIBILITY ->
+                            dispatchSwipeGesture(svc, sx, sy, ex, ey, duration)
+                    }
+                },
+                verify = { waitForStableSurfaceChange(svc, beforePage, beforeVisual) },
+            )
+            if (result.verified) "✅ 已滑动并通过连续两帧页面变化确认结果"
+            else if (result.uncertainDispatch) "⚠️ 滑动最多已尝试一个备用通道，但页面未稳定变化；必须重新观察"
+            else "❌ 滑动动作未能派发"
         } catch (e: Exception) {
             "❌ 滑动失败: ${e.message}"
         }
@@ -878,15 +938,13 @@ class SwipeScreenTool : QuroTool {
 
     private data class Quadruple(val f1: Float, val f2: Float, val f3: Float, val f4: Float)
 
-    private fun dispatchSwipe(svc: AccessibilityService, sx: Float, sy: Float, ex: Float, ey: Float, dur: Long): String {
+    private fun dispatchSwipeGesture(svc: AccessibilityService, sx: Float, sy: Float, ex: Float, ey: Float, dur: Long): Boolean {
         val path = Path().apply { moveTo(sx, sy); lineTo(ex, ey) }
         val gd = android.accessibilityservice.GestureDescription.Builder()
             .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(path, 0L, dur))
             .build()
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            val dispatched = svc.dispatchGesture(gd, null, null)
-            return if (dispatched) "⚠️ 已派发滑动 ($sx,$sy)→($ex,$ey)（结果无法同步确认）"
-            else "❌ 滑动手势被系统拒绝派发"
+            return svc.dispatchGesture(gd, null, null)
         }
         val done = CountDownLatch(1)
         val ok = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -894,10 +952,9 @@ class SwipeScreenTool : QuroTool {
             override fun onCompleted(gd: android.accessibilityservice.GestureDescription?) { ok.set(true); done.countDown() }
             override fun onCancelled(gd: android.accessibilityservice.GestureDescription?) { ok.set(false); done.countDown() }
         }, Handler(Looper.getMainLooper()))
-        if (!dispatched) return "❌ 滑动手势被系统拒绝派发"
+        if (!dispatched) return false
         done.await(2, TimeUnit.SECONDS)
-        // onCompleted 仅代表「系统已派发手势」，不代表滑动真的命中了可滚内容，故标 ⚠️ 而非 ✅
-        return if (ok.get()) "⚠️ 已派发滑动手势 ($sx,$sy)→($ex,$ey)（结果无法同步确认）" else "❌ 滑动被取消或超时"
+        return ok.get()
     }
 }
 

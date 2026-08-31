@@ -57,7 +57,7 @@ jobs:
       - name: Upload signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: ZorvAI-v1.16-p40.32-full-release
+          name: ZorvAI-v1.16-p40.33-full-release
           path: app/build/outputs/apk/full/release/*.apk
           if-no-files-found: error
           retention-days: 7

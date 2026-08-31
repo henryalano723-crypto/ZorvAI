@@ -319,6 +319,7 @@ class SendMessageInAppTool : QuroTool {
             "confirm_send":{"type":"boolean","description":"当前用户是否明确授权立即发送；默认 false","default":false},
             "transaction_id":{"type":"string","description":"自绘页面返回 needs_visual 后必须原样回传的事务 ID"},
             "resume_stage":{"type":"string","enum":["verify_search_field","select_contact","verify_conversation","verify_draft","verify_sent"],"description":"必须与上一次 needs_visual 返回的 stage 完全一致"},
+            "observation_version":{"type":"integer","description":"needs_visual 返回的页面观察版本；坐标只对该版本有效，必须原样回传"},
             "visual_verified":{"type":"boolean","description":"视觉上是否满足该阶段 instruction 的全部精确条件；不确定必须 false"},
             "action_x":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 x；只在 instruction 要求点击时提供"},
             "action_y":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 y；只在 instruction 要求点击时提供"},
@@ -346,6 +347,10 @@ class SendMessageInAppTool : QuroTool {
         var stage: VisualStage,
         var screenshotWidth: Int = 0,
         var screenshotHeight: Int = 0,
+        var observationVersion: Long = 0L,
+        var observationMode: String = VerifiedUiActionExecutor.ObservationMode.SCREENSHOT_VISUAL.wire,
+        var searchInputAttempted: Boolean = false,
+        var messageInputAttempted: Boolean = false,
         var contactVisualRetries: Int = 0,
         var pendingContactChoices: List<ContactChoice> = emptyList(),
     )
@@ -379,6 +384,7 @@ class SendMessageInAppTool : QuroTool {
                 arguments = JSONObject()
                     .put("transaction_id", transaction.id)
                     .put("resume_stage", transaction.stage.wire)
+                    .put("observation_version", transaction.observationVersion)
                     .put("visual_verified", !cancel)
                     .put("cancel_contact_choice", cancel)
                     .apply {
@@ -754,6 +760,15 @@ class SendMessageInAppTool : QuroTool {
                     "已丢弃上一坐标。只按当前截图和当前阶段重新核对，禁止猜测已经进入下一页。",
             )
         }
+        val suppliedObservation = args.optLong("observation_version", 0L)
+        if (suppliedObservation != transaction.observationVersion || suppliedObservation <= 0L) {
+            return captureVisualStage(
+                context,
+                transaction,
+                "回传 observation_version=$suppliedObservation 已缺失或过期；旧截图坐标已丢弃。" +
+                    "只能按新截图和新版本重新观察，禁止复用坐标。",
+            )
+        }
         if (args.optBoolean("cancel_contact_choice", false)) {
             visualTransactions.remove(transactionId)
             return "✅ [MESSAGE_CONTACT_CHOICE_CANCELLED] 已取消本次联系人选择，未输入或发送消息"
@@ -806,10 +821,25 @@ class SendMessageInAppTool : QuroTool {
             VisualStage.VERIFY_SEARCH_FIELD -> {
                 val point = requiredVisualPoint(args, transaction)
                     ?: return "❌ [定位搜索框] 缺少唯一搜索框的有效中心坐标"
-                if (!dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())) {
-                    return "❌ [定位搜索框] 点击动作未能派发"
+                val focused = executeVerifiedVisualClick(
+                    context = context,
+                    svc = svc,
+                    cacheKey = "message_search_focus",
+                    point = point,
+                    retrySafety = VerifiedUiActionExecutor.RetrySafety.SAFE_TO_REPEAT,
+                    verify = { waitForTargetInputFocus(svc, transaction.targetPackage) },
+                )
+                if (!focused.verified) {
+                    return captureVisualStage(
+                        context,
+                        transaction,
+                        "搜索框动作最多已尝试一个备用通道，但未证明目标应用获得输入焦点；已重新观察，禁止输入。",
+                    )
                 }
-                Thread.sleep(300)
+                if (!VerifiedUiActionExecutor.canDispatchInput(focusVerified = true, alreadyAttempted = transaction.searchInputAttempted)) {
+                    return "❌ [输入联系人] 本事务已经派发过一次联系人输入；结果不确定时禁止重复输入，必须终止后重新开始"
+                }
+                transaction.searchInputAttempted = true
                 val pasted = PasteFocusedTextTool().run(
                     context,
                     JSONObject().put("text", transaction.contact).toString(),
@@ -830,22 +860,15 @@ class SendMessageInAppTool : QuroTool {
                 transaction.pendingContactChoices = emptyList()
                 val beforeConversation = captureRealAppSurfaceFingerprint(context, svc)
                     ?: return "❌ [选择联系人] 点击前无法建立目标页面验证基线，禁止继续"
-                // WeChat's FTS surface may accept dispatchGesture() while performing no click.
-                // Once an exact bounded candidate is selected, use the authorized shell input
-                // channel first; accessibility remains the no-privilege fallback.
-                val shizukuClick = QuroShizukuBridge.exec(
-                    context,
-                    "input tap ${point.first} ${point.second} && echo ZORV_CONTACT_TAP_OK",
+                val selected = executeVerifiedVisualClick(
+                    context = context,
+                    svc = svc,
+                    cacheKey = "message_select_contact",
+                    point = point,
+                    retrySafety = VerifiedUiActionExecutor.RetrySafety.SAFE_TO_REPEAT,
+                    verify = { waitForStableAppSurfaceChange(context, svc, beforeConversation) },
                 )
-                val clickDispatched = if (!shizukuClick.contains("ZORV_CONTACT_TAP_OK")) {
-                    dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())
-                } else {
-                    true
-                }
-                if (!clickDispatched) {
-                    return "❌ [选择联系人] 点击动作未能派发"
-                }
-                if (!waitForStableAppSurfaceChange(context, svc, beforeConversation)) {
+                if (!selected.verified) {
                     return captureVisualStage(
                         context,
                         transaction,
@@ -857,10 +880,25 @@ class SendMessageInAppTool : QuroTool {
             }
             VisualStage.VERIFY_CONVERSATION -> {
                 val point = requiredVisualPoint(args, transaction) ?: return "❌ [定位消息框] 缺少唯一消息输入框的有效中心坐标"
-                if (!dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())) {
-                    return "❌ [定位消息框] 点击动作未能派发"
+                val focused = executeVerifiedVisualClick(
+                    context = context,
+                    svc = svc,
+                    cacheKey = "message_body_focus",
+                    point = point,
+                    retrySafety = VerifiedUiActionExecutor.RetrySafety.SAFE_TO_REPEAT,
+                    verify = { waitForTargetInputFocus(svc, transaction.targetPackage) },
+                )
+                if (!focused.verified) {
+                    return captureVisualStage(
+                        context,
+                        transaction,
+                        "消息框动作最多已尝试一个备用通道，但未证明目标应用获得输入焦点；已重新观察，禁止输入正文。",
+                    )
                 }
-                Thread.sleep(250)
+                if (!VerifiedUiActionExecutor.canDispatchInput(focusVerified = true, alreadyAttempted = transaction.messageInputAttempted)) {
+                    return "❌ [输入消息] 本事务已经派发过一次正文输入；结果不确定时禁止重复输入，必须终止后重新开始"
+                }
+                transaction.messageInputAttempted = true
                 val pasted = PasteFocusedTextTool().run(
                     context,
                     JSONObject().put("text", transaction.message).toString(),
@@ -875,12 +913,26 @@ class SendMessageInAppTool : QuroTool {
                     return "✅ [MESSAGE_DRAFT_VERIFIED] 已视觉核对会话“${transaction.contact}”和完整正文；按授权要求停在草稿，未发送"
                 }
                 val point = requiredVisualPoint(args, transaction) ?: return "❌ [发送] 缺少唯一发送按钮的有效中心坐标"
-                if (!dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())) {
+                val beforeSend = captureRealAppSurfaceFingerprint(context, svc)
+                    ?: return "❌ [发送] 无法建立发送前验证基线，禁止发送"
+                val sent = executeVerifiedVisualClick(
+                    context = context,
+                    svc = svc,
+                    cacheKey = "message_send_once",
+                    point = point,
+                    retrySafety = VerifiedUiActionExecutor.RetrySafety.DISPATCH_ONCE,
+                    verify = { waitForStableAppSurfaceChange(context, svc, beforeSend) },
+                )
+                if (!sent.verified && !sent.uncertainDispatch) {
                     return "❌ [发送] 点击动作未能派发"
                 }
-                Thread.sleep(700)
                 transaction.stage = VisualStage.VERIFY_SENT
-                captureVisualStage(context, transaction)
+                captureVisualStage(
+                    context,
+                    transaction,
+                    if (sent.verified) null else
+                        "发送动作已派发一次但同步结果不确定；为避免重复消息绝不换通道重试，只能从当前画面核对发送结果。",
+                )
             }
             VisualStage.VERIFY_SENT -> {
                 visualTransactions.remove(transactionId)
@@ -940,11 +992,20 @@ class SendMessageInAppTool : QuroTool {
             visualTransactions.remove(transaction.id)
             return "❌ [截图核对] 未取得真实屏幕像素（尺寸过小），消息事务已安全终止"
         }
+        val currentNodes = snapshotVisibleNodes(activeTarget)
+        transaction.observationMode = VerifiedUiActionExecutor.observationMode(
+            currentNodes.any { (_, node) ->
+                node.text.isNotBlank() || node.hint.isNotBlank() || node.description.isNotBlank() || node.editable
+            },
+        ).wire
+        transaction.observationVersion = VerifiedUiActionExecutor.nextObservationVersion()
         return json.apply {
             put("status", "needs_visual")
             put("workflow", "message_send")
             put("stage", transaction.stage.wire)
             put("transaction_id", transaction.id)
+            put("observation_version", transaction.observationVersion)
+            put("observation_mode", transaction.observationMode)
             put("app_name", transaction.appName)
             put("exact_target", transaction.contact)
             put("confirm_send", transaction.confirmSend)
@@ -975,39 +1036,88 @@ class SendMessageInAppTool : QuroTool {
         return false
     }
 
+    private fun executeVerifiedVisualClick(
+        context: Context,
+        svc: com.ai.assistance.quro.service.QuroAccessibilityService,
+        cacheKey: String,
+        point: Pair<Int, Int>,
+        retrySafety: VerifiedUiActionExecutor.RetrySafety,
+        verify: () -> Boolean,
+    ): VerifiedUiActionExecutor.Result = VerifiedUiActionExecutor.execute(
+        cacheKey = cacheKey,
+        retrySafety = retrySafety,
+        dispatch = { route ->
+            when (route) {
+                VerifiedUiActionExecutor.Route.SHIZUKU -> QuroShizukuBridge.exec(
+                    context,
+                    "input tap ${point.first} ${point.second} && echo ZORV_UI_ACTION_OK",
+                ).contains("ZORV_UI_ACTION_OK")
+                VerifiedUiActionExecutor.Route.ACCESSIBILITY ->
+                    dispatchPointClick(svc, point.first.toFloat(), point.second.toFloat())
+            }
+        },
+        verify = verify,
+    )
+
+    private fun waitForTargetInputFocus(
+        svc: com.ai.assistance.quro.service.QuroAccessibilityService,
+        targetPackage: String,
+    ): Boolean {
+        val samples = mutableListOf<Boolean>()
+        repeat(8) {
+            Thread.sleep(200)
+            val root = ExternalUiTargetSession.rootForAutomation(svc)
+            val targetActive = root?.packageName?.toString() == targetPackage
+            val focusedNode = root?.let(::snapshotVisibleNodes)
+                ?.any { (node, _) -> node.isEditable && node.isFocused }
+                ?: false
+            samples += targetActive && (focusedNode || hasInputMethodWindow(svc))
+            if (VerifiedUiActionExecutor.hasStableChange(samples)) return true
+        }
+        return false
+    }
+
     private fun visualStageInstruction(transaction: VisualTransaction): String = when (transaction.stage) {
         VisualStage.VERIFY_SEARCH_FIELD ->
             "只有画面明确是目标应用的全局搜索页且顶部搜索输入框唯一时，才调用 send_message_in_app，" +
-                "原样回传 transaction_id、resume_stage=verify_search_field、visual_verified=true 和搜索框中心 action_x/action_y。" +
+                "原样回传 transaction_id、observation_version、resume_stage=verify_search_field、visual_verified=true 和搜索框中心 action_x/action_y。" +
                 "不得调用 input_text、tap_screen、search_and_launch_app 或 activate_app_search；无法确认时 visual_verified=false。"
         VisualStage.SELECT_CONTACT ->
             "只检查‘联系人’分区，禁止把群聊名称、群聊成员命中或聊天记录正文当作联系人。" +
                 "只有联系人分区中恰好一个结果的可见名称与“${transaction.contact}”完全一致时，才调用 send_message_in_app，" +
-                "原样回传 transaction_id、resume_stage=select_contact、visual_verified=true 和该结果中心 action_x/action_y。" +
+                "原样回传 transaction_id、observation_version、resume_stage=select_contact、visual_verified=true 和该结果中心 action_x/action_y。" +
                 "若联系人分区有多个精确同名联系人，visual_verified=false，并用 candidate_options 返回每个候选在画面可见的备注/微信号尾号/地区等区分信息，以及该联系人行中心 action_x/action_y；" +
                 "不要再点搜索图标，不要直接调用 tap_screen，不要报告完成。"
         VisualStage.VERIFY_CONVERSATION ->
             "必须确认已离开搜索页，画面不再显示联系人、群聊或聊天记录结果分区；" +
                 "只有顶部会话名称精确等于“${transaction.contact}”且底部消息输入框唯一时，才调用 send_message_in_app，" +
-                "原样回传 transaction_id、resume_stage=verify_conversation、visual_verified=true 和输入框中心 action_x/action_y。" +
+                "原样回传 transaction_id、observation_version、resume_stage=verify_conversation、visual_verified=true 和输入框中心 action_x/action_y。" +
                 "顶部搜索框绝不是消息输入框；标题不符、仍在搜索页或底部输入框不唯一时 visual_verified=false，禁止输入。"
         VisualStage.VERIFY_DRAFT ->
             "必须确认会话名称精确等于“${transaction.contact}”且输入框正文与原始正文逐字一致。" +
                 if (transaction.confirmSend) {
-                    "确认且发送按钮唯一时调用 send_message_in_app，回传 transaction_id、resume_stage=verify_draft、visual_verified=true 和发送按钮中心 action_x/action_y；否则 visual_verified=false。"
+                    "确认且发送按钮唯一时调用 send_message_in_app，回传 transaction_id、observation_version、resume_stage=verify_draft、visual_verified=true 和发送按钮中心 action_x/action_y；否则 visual_verified=false。"
                 } else {
-                    "确认后调用 send_message_in_app，回传 transaction_id、resume_stage=verify_draft、visual_verified=true；禁止提供发送坐标。"
+                    "确认后调用 send_message_in_app，回传 transaction_id、observation_version、resume_stage=verify_draft、visual_verified=true；禁止提供发送坐标。"
                 }
         VisualStage.VERIFY_SENT ->
             "只有发送后输入框已清空，并且会话中出现与原始正文逐字一致的新消息时，才调用 send_message_in_app，" +
-                "回传 transaction_id、resume_stage=verify_sent、visual_verified=true；任一证据缺失都必须 visual_verified=false。"
+                "回传 transaction_id、observation_version、resume_stage=verify_sent、visual_verified=true；任一证据缺失都必须 visual_verified=false。"
     }
 
     private fun requiredVisualPoint(args: JSONObject, transaction: VisualTransaction): Pair<Int, Int>? {
         if (!args.has("action_x") || !args.has("action_y")) return null
         val x = args.optInt("action_x", -1)
         val y = args.optInt("action_y", -1)
-        return if (x in 0 until transaction.screenshotWidth && y in 0 until transaction.screenshotHeight) {
+        val suppliedVersion = args.optLong("observation_version", 0L)
+        return if (VerifiedUiActionExecutor.acceptsObservation(
+                transaction.observationVersion,
+                suppliedVersion,
+                x,
+                y,
+                transaction.screenshotWidth,
+                transaction.screenshotHeight,
+            )) {
             x to y
         } else {
             null
