@@ -97,6 +97,18 @@ class AppMessageIntentCompilerTest {
     }
 
     @Test
+    fun negatedSendLanguageNeverAuthorizesAMessageTransaction() {
+        val readOnlyContactAudit =
+            "打开微信，查看当前搜索结果。只统计联系人分区中与搜索词完全一致的联系人。" +
+                "不要点击任何结果，不要进入聊天，不要发送任何消息。"
+
+        assertEquals(false, AppMessageIntentCompiler.hasExplicitSend(readOnlyContactAudit))
+        assertNull(AppMessageIntentCompiler.parse(readOnlyContactAudit))
+        assertEquals(false, AppMessageIntentCompiler.hasExplicitSend("只输入草稿，不要点击发送"))
+        assertNull(AppMessageIntentCompiler.parse("打开微信搜索灵儿，不要发送任何消息"))
+    }
+
+    @Test
     fun matchingPendingSearchHandsCurrentResultsToMessageTransaction() {
         val intent = AppMessageIntentCompiler.Intent("微信", "文件传输助手", "测试内容", confirmSend = true)
         val searchCall = QuroToolCall(

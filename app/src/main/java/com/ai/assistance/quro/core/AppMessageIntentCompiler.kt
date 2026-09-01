@@ -30,6 +30,11 @@ internal object AppMessageIntentCompiler {
         "(?:发送(?:消息|信息)?|发出|发消息|发信息|发给|给.{1,40}?发|(?:搜索|搜|查找).{1,40}?(?:然后|并|再)?发|(?:打开|去|在|用).{1,30}?(?:跟|对).{1,40}?说|点击发送|按发送|回复|转发|send\\s+(?:a\\s+)?message)",
         RegexOption.IGNORE_CASE,
     )
+    private val negatedSend = Regex(
+        "(?:不要|请勿|禁止|切勿|无需|不用|不许|不可|不能|别)\\s*(?:再\\s*)?(?:点击|按)?\\s*" +
+            "(?:发送(?:任何)?(?:消息|信息)?|发出|发消息|发信息|发给|回复|转发|send\\s+(?:a\\s+)?message)",
+        RegexOption.IGNORE_CASE,
+    )
     private val searchWord = Regex("(?:搜索|搜|查找)")
     private val inputWord = Regex("(?:然后|并|，|,)?\\s*(?:点击[^，,。.!！]{0,20})?\\s*(?:输入|填写|写入)")
     private val trailingSend = Regex(
@@ -44,7 +49,14 @@ internal object AppMessageIntentCompiler {
             "(?:然后|并|再)?\\s*(?:发送(?:消息|信息)?|发消息|发信息|发|说)\\s*[：:]?\\s*(.+?)\\s*[。.!！]?$",
     )
 
-    fun hasExplicitSend(userText: String): Boolean = explicitSend.containsMatchIn(userText)
+    fun hasExplicitSend(userText: String): Boolean {
+        // A prohibition is not authorization. Mask locally negated send phrases before the
+        // broader natural-language matcher runs; otherwise a read-only instruction such as
+        // “查看搜索结果，不要发送任何消息” is mistaken for a message transaction merely
+        // because it contains the word “发送”. False negatives are safer than false sends.
+        val positiveOnly = negatedSend.replace(userText, "")
+        return explicitSend.containsMatchIn(positiveOnly)
+    }
 
     /** Only this structured marker may keep a message turn open for another visual step. */
     fun isVisualContinuation(toolResult: String): Boolean {

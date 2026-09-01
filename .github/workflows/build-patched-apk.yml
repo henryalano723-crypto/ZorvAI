@@ -46,8 +46,8 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.ZORV_KEYSTORE_BASE64 }}
         run: printf '%s' "$KEYSTORE_BASE64" | base64 --decode > zorv-release.jks
 
-      - name: Verify OpenAI GPT-5 and contact-section safety
-        run: gradle :app:testFullDebugUnitTest --tests "com.ai.assistance.quro.core.network.QuroOpenAiModelParametersTest" --tests "com.ai.assistance.quro.core.tools.SendMessageInAppChoiceTest" --stacktrace --no-daemon
+      - name: Verify OpenAI GPT-5 and message safety
+        run: gradle :app:testFullDebugUnitTest --tests "com.ai.assistance.quro.core.network.QuroOpenAiModelParametersTest" --tests "com.ai.assistance.quro.core.AppMessageIntentCompilerTest" --tests "com.ai.assistance.quro.core.tools.SendMessageInAppChoiceTest" --stacktrace --no-daemon
 
       - name: Build signed full release APK
         env:
@@ -60,7 +60,7 @@ jobs:
       - name: Upload signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: ZorvAI-v1.16-p40.36-full-release
+          name: ZorvAI-v1.16-p40.37-full-release
           path: app/build/outputs/apk/full/release/*.apk
           if-no-files-found: error
           retention-days: 7
