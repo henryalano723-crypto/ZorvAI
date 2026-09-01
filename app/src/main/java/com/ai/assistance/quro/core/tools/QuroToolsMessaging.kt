@@ -324,6 +324,7 @@ class SendMessageInAppTool : QuroTool {
             "action_x":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 x；只在 instruction 要求点击时提供"},
             "action_y":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 y；只在 instruction 要求点击时提供"},
             "candidate_options":{"type":"array","items":{"type":"object","properties":{"section":{"type":"string","enum":["contact","group","chat_history","web_search","other"]},"label":{"type":"string"},"action_x":{"type":"integer"},"action_y":{"type":"integer"}},"required":["section","label","action_x","action_y"]},"description":"select_contact 阶段必须返回画面中每个同名文字命中，并按最近的可见分区标题归类；代码只接受 section=contact 的精确联系人，字号和高亮不构成新候选"},
+            "section_headers":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"action_x":{"type":"integer"},"action_y":{"type":"integer"}},"required":["label","action_x","action_y"]},"description":"select_contact 阶段必须按屏幕从上到下列出所有可见分区标题及标题中心；本地代码依据标题与候选纵向位置重新归类，不信任 candidate_options.section"},
             "cancel_contact_choice":{"type":"boolean","description":"用户在候选选择中明确回答都不是或取消时为 true"}
         }
     }"""
@@ -356,6 +357,7 @@ class SendMessageInAppTool : QuroTool {
     )
 
     internal data class ContactChoice(val section: String, val label: String, val x: Int, val y: Int)
+    internal data class SectionHeader(val label: String, val x: Int, val y: Int)
 
     companion object {
         private const val VISUAL_TRANSACTION_TTL_MS = 5 * 60 * 1000L
@@ -438,11 +440,28 @@ class SendMessageInAppTool : QuroTool {
         internal fun exactContactSectionCandidates(
             contact: String,
             candidates: List<ContactChoice>,
-        ): List<ContactChoice> = candidates
-            .filter { isExactContactSectionCandidate(contact, it.section, it.label) }
+            sectionHeaders: List<SectionHeader>,
+        ): List<ContactChoice> {
+            val orderedHeaders = sectionHeaders
+                .filter { it.label.isNotBlank() && it.x >= 0 && it.y >= 0 }
+                .sortedBy { it.y }
+            if (orderedHeaders.none { isContactSectionHeader(it.label) }) return emptyList()
+            return candidates
+            // Ignore the model's self-declared section. Reclassify every row from the nearest
+            // visible heading above its centre, so page-wide OCR count fluctuations cannot turn
+            // a chat-history/group hit into a contact merely by writing section="contact".
+            .filter { candidate ->
+                val nearestHeader = orderedHeaders.lastOrNull { it.y < candidate.y }
+                nearestHeader != null && isContactSectionHeader(nearestHeader.label) &&
+                    isExactContactSectionCandidate(contact, "contact", candidate.label)
+            }
             // A highlighted glyph and the normal-sized row label can be reported separately by
             // vision even though they point at the same row centre. Count the row only once.
-            .distinctBy { Triple(it.section.trim().lowercase(), it.x, it.y) }
+            .distinctBy { Pair(it.x, it.y) }
+        }
+
+        internal fun isContactSectionHeader(label: String): Boolean =
+            Regex("^联系人(?:\\s*[（(]?\\d+[）)]?)?$").matches(label.trim())
 
         private fun pruneExpiredVisualTransactions() {
             val cutoff = System.currentTimeMillis() - VISUAL_TRANSACTION_TTL_MS
@@ -816,7 +835,19 @@ class SendMessageInAppTool : QuroTool {
                     }
                 }
             }.orEmpty()
-            val contactOptions = exactContactSectionCandidates(transaction.contact, options)
+            val sectionHeaders = args.optJSONArray("section_headers")?.let { array ->
+                (0 until array.length()).mapNotNull { index ->
+                    val item = array.optJSONObject(index) ?: return@mapNotNull null
+                    val label = item.optString("label").trim()
+                    val x = item.optInt("action_x", -1)
+                    val y = item.optInt("action_y", -1)
+                    SectionHeader(label, x, y).takeIf {
+                        label.isNotEmpty() && x in 0 until transaction.screenshotWidth &&
+                            y in 0 until transaction.screenshotHeight
+                    }
+                }
+            }.orEmpty()
+            val contactOptions = exactContactSectionCandidates(transaction.contact, options, sectionHeaders)
             val singleton = contactOptions.singleOrNull()
             if (singleton != null) {
                 args.put("visual_verified", true)
@@ -834,8 +865,8 @@ class SendMessageInAppTool : QuroTool {
                 return captureVisualStage(
                     context,
                     transaction,
-                    "上一张图的候选缺少可验证的联系人分区归属。请重新列出画面中每个同名文字命中，" +
-                        "并为每项返回 candidate_options.section；本地代码将过滤非联系人分区。",
+                    "上一张图缺少可验证的联系人标题与候选位置证据。请重新列出每个同名文字命中，" +
+                        "并用 section_headers 列出所有可见分区标题及坐标；本地代码将按最近标题重新归类。",
                 )
             } else {
                 visualTransactions.remove(transactionId)
@@ -1125,7 +1156,8 @@ class SendMessageInAppTool : QuroTool {
                 "只有联系人分区中恰好一个结果的可见名称与“${transaction.contact}”完全一致时，才调用 send_message_in_app，" +
                 "原样回传 transaction_id、observation_version、resume_stage=select_contact、visual_verified=true 和该结果中心 action_x/action_y。" +
                 "无论你认为有几个联系人，都必须用 candidate_options 列出画面中每个包含同名文字的结果；section 按最近的分区标题分别填写 contact、group、chat_history、web_search 或 other，label 写该行可见文字和区分信息，并返回该行中心 action_x/action_y。" +
-                "不要自行省略其他分区的同名命中；本地代码会过滤，只按 section=contact 的精确行决定进入或询问。" +
+                "同时必须用 section_headers 按屏幕从上到下列出所有可见分区标题的原文和中心坐标。" +
+                "不要自行省略其他分区的同名命中；本地代码不信任 section 字段，而是按候选上方最近的真实标题重新归类。" +
                 "不要再点搜索图标，不要直接调用 tap_screen，不要报告完成。"
         VisualStage.VERIFY_CONVERSATION ->
             "必须确认已离开搜索页，画面不再显示联系人、群聊或聊天记录结果分区；" +

@@ -42,7 +42,16 @@ class SendMessageInAppChoiceTest {
 
         assertEquals(
             listOf(candidates.first()),
-            SendMessageInAppTool.exactContactSectionCandidates("灵儿", candidates),
+            SendMessageInAppTool.exactContactSectionCandidates(
+                "灵儿",
+                candidates,
+                listOf(
+                    SendMessageInAppTool.SectionHeader("联系人", 120, 330),
+                    SendMessageInAppTool.SectionHeader("群聊", 120, 600),
+                    SendMessageInAppTool.SectionHeader("聊天记录", 120, 850),
+                    SendMessageInAppTool.SectionHeader("网络搜索", 120, 1100),
+                ),
+            ),
         )
     }
 
@@ -54,7 +63,17 @@ class SendMessageInAppChoiceTest {
             SendMessageInAppTool.ContactChoice("chat_history", "灵儿", 540, 900),
         )
 
-        assertEquals(2, SendMessageInAppTool.exactContactSectionCandidates("灵儿", candidates).size)
+        assertEquals(
+            2,
+            SendMessageInAppTool.exactContactSectionCandidates(
+                "灵儿",
+                candidates,
+                listOf(
+                    SendMessageInAppTool.SectionHeader("联系人（2）", 120, 330),
+                    SendMessageInAppTool.SectionHeader("聊天记录", 120, 820),
+                ),
+            ).size,
+        )
     }
 
     @Test
@@ -64,6 +83,45 @@ class SendMessageInAppChoiceTest {
             SendMessageInAppTool.ContactChoice("CONTACT", "灵儿｜高亮文字", 540, 420),
         )
 
-        assertEquals(1, SendMessageInAppTool.exactContactSectionCandidates("灵儿", candidates).size)
+        assertEquals(
+            1,
+            SendMessageInAppTool.exactContactSectionCandidates(
+                "灵儿",
+                candidates,
+                listOf(SendMessageInAppTool.SectionHeader("联系人", 120, 330)),
+            ).size,
+        )
+    }
+
+    @Test
+    fun rejectsModelDeclaredContactWhenNearestVisibleHeaderIsNotContacts() {
+        val fabricated = listOf(
+            SendMessageInAppTool.ContactChoice("contact", "灵儿", 540, 720),
+        )
+        val headers = listOf(
+            SendMessageInAppTool.SectionHeader("联系人", 120, 330),
+            SendMessageInAppTool.SectionHeader("聊天记录", 120, 650),
+        )
+
+        assertEquals(
+            emptyList<SendMessageInAppTool.ContactChoice>(),
+            SendMessageInAppTool.exactContactSectionCandidates("灵儿", fabricated, headers),
+        )
+    }
+
+    @Test
+    fun rejectsCandidatesWhenContactsHeaderEvidenceIsMissing() {
+        val fabricated = listOf(
+            SendMessageInAppTool.ContactChoice("contact", "灵儿", 540, 420),
+        )
+
+        assertEquals(
+            emptyList<SendMessageInAppTool.ContactChoice>(),
+            SendMessageInAppTool.exactContactSectionCandidates(
+                "灵儿",
+                fabricated,
+                listOf(SendMessageInAppTool.SectionHeader("聊天记录", 120, 330)),
+            ),
+        )
     }
 }

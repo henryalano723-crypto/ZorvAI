@@ -26,4 +26,14 @@ class QuroOpenAiModelParametersTest {
         assertFalse(usesOpenAiReasoningChatParameters("gpt-4.1-mini"))
         assertFalse(usesOpenAiReasoningChatParameters("deepseek-chat"))
     }
+
+    @Test
+    fun `only gpt 5 6 family disables reasoning for chat completion tools`() {
+        assertTrue(usesOpenAiToolCompatibleReasoningNone("gpt-5.6"))
+        assertTrue(usesOpenAiToolCompatibleReasoningNone("gpt-5.6-terra"))
+        assertTrue(usesOpenAiToolCompatibleReasoningNone(" GPT-5.6-LUNA "))
+        assertFalse(usesOpenAiToolCompatibleReasoningNone("gpt-5-mini"))
+        assertFalse(usesOpenAiToolCompatibleReasoningNone("gpt-4o-mini"))
+        assertFalse(usesOpenAiToolCompatibleReasoningNone("o3-mini"))
+    }
 }

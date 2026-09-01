@@ -48,6 +48,10 @@ private const val MAX_OUTPUT_TOKENS = 131_072
 internal fun usesOpenAiReasoningChatParameters(model: String): Boolean =
     Regex("(?i)^(?:o[0-9]|gpt-5(?:[.-]|$))").containsMatchIn(model.trim())
 
+/** GPT-5.6 的 Chat Completions 在同时使用 function tools 时要求关闭 reasoning。 */
+internal fun usesOpenAiToolCompatibleReasoningNone(model: String): Boolean =
+    Regex("(?i)^gpt-5\\.6(?:[.-]|$)").containsMatchIn(model.trim())
+
 /**
  * 单次 HTTP 调用的硬超时护栏（毫秒）。
  * 作用：OkHttp 自带 connect/read 超时在「代理挂起 / 端点假死」时仍可能长时间不返回，
@@ -199,6 +203,11 @@ class QuroLlmClient(
             if (toolsJson != null) {
                 put("tools", toolsJson)
                 put("tool_choice", "auto")
+                if (usesOpenAiToolCompatibleReasoningNone(model)) {
+                    // GPT-5.6 默认 reasoning 与 Chat Completions function tools 不兼容。
+                    // 关闭 reasoning 只作用于工具轮；普通无工具对话仍采用模型默认推理强度。
+                    put("reasoning_effort", "none")
+                }
             }
             if (stream) put("stream", true)
         }
