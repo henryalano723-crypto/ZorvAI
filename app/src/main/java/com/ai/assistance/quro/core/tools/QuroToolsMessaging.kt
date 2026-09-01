@@ -323,7 +323,7 @@ class SendMessageInAppTool : QuroTool {
             "visual_verified":{"type":"boolean","description":"视觉上是否满足该阶段 instruction 的全部精确条件；不确定必须 false"},
             "action_x":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 x；只在 instruction 要求点击时提供"},
             "action_y":{"type":"integer","description":"该阶段唯一目标的真实屏幕中心 y；只在 instruction 要求点击时提供"},
-            "candidate_options":{"type":"array","items":{"type":"object","properties":{"section":{"type":"string","enum":["contact","group","chat_history","web_search","other"]},"label":{"type":"string"},"action_x":{"type":"integer"},"action_y":{"type":"integer"}},"required":["section","label","action_x","action_y"]},"description":"select_contact 阶段必须返回画面中每个同名文字命中，并按最近的可见分区标题归类；代码只接受 section=contact 的精确联系人，字号和高亮不构成新候选"},
+            "candidate_options":{"type":"array","items":{"type":"object","properties":{"section":{"type":"string","enum":["contact","group","chat_history","web_search","other"]},"label":{"type":"string"},"action_x":{"type":"integer"},"action_y":{"type":"integer"},"row_role_label":{"type":"string","description":"该候选行内可见的对象类型原文，例如联系人；没有则为空"},"row_role_x":{"type":"integer"},"row_role_y":{"type":"integer"},"row_left":{"type":"integer"},"row_top":{"type":"integer"},"row_right":{"type":"integer"},"row_bottom":{"type":"integer"}},"required":["section","label","action_x","action_y","row_role_label","row_role_x","row_role_y","row_left","row_top","row_right","row_bottom"]},"description":"select_contact 阶段必须每个可点击结果行只返回一个候选和一个点击中心；行内类型文字及坐标必须绑定在同一行矩形内。代码根据可见分区或行内类型证据判定，绝不相信数量"},
             "section_headers":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"action_x":{"type":"integer"},"action_y":{"type":"integer"}},"required":["label","action_x","action_y"]},"description":"select_contact 阶段必须按屏幕从上到下列出所有可见分区标题及标题中心；本地代码依据标题与候选纵向位置重新归类，不信任 candidate_options.section"},
             "cancel_contact_choice":{"type":"boolean","description":"用户在候选选择中明确回答都不是或取消时为 true"}
         }
@@ -356,7 +356,19 @@ class SendMessageInAppTool : QuroTool {
         var pendingContactChoices: List<ContactChoice> = emptyList(),
     )
 
-    internal data class ContactChoice(val section: String, val label: String, val x: Int, val y: Int)
+    internal data class ContactChoice(
+        val section: String,
+        val label: String,
+        val x: Int,
+        val y: Int,
+        val rowRoleLabel: String = "",
+        val rowRoleX: Int = -1,
+        val rowRoleY: Int = -1,
+        val rowLeft: Int = -1,
+        val rowTop: Int = -1,
+        val rowRight: Int = -1,
+        val rowBottom: Int = -1,
+    )
     internal data class SectionHeader(val label: String, val x: Int, val y: Int)
 
     companion object {
@@ -445,23 +457,54 @@ class SendMessageInAppTool : QuroTool {
             val orderedHeaders = sectionHeaders
                 .filter { it.label.isNotBlank() && it.x >= 0 && it.y >= 0 }
                 .sortedBy { it.y }
-            if (orderedHeaders.none { isContactSectionHeader(it.label) }) return emptyList()
             return candidates
-            // Ignore the model's self-declared section. Reclassify every row from the nearest
-            // visible heading above its centre, so page-wide OCR count fluctuations cannot turn
-            // a chat-history/group hit into a contact merely by writing section="contact".
+            // Ignore the model's self-declared section. A row is a contact only when either its
+            // nearest visible heading is explicitly a contacts section, or a visible contact-role
+            // label is geometrically bound inside that same result row. Generic headings such as
+            // "Frequently used" therefore remain app-agnostic instead of being hard-coded.
             .filter { candidate ->
                 val nearestHeader = orderedHeaders.lastOrNull { it.y < candidate.y }
-                nearestHeader != null && isContactSectionHeader(nearestHeader.label) &&
+                val sectionProvesContact = nearestHeader?.let { isContactSectionHeader(it.label) } == true
+                val sectionProvesNonContact = nearestHeader?.let { isNonContactSectionHeader(it.label) } == true
+                val rowProvesContact = hasBoundContactRoleEvidence(candidate)
+                !sectionProvesNonContact && (sectionProvesContact || rowProvesContact) &&
                     isExactContactSectionCandidate(contact, "contact", candidate.label)
             }
-            // A highlighted glyph and the normal-sized row label can be reported separately by
-            // vision even though they point at the same row centre. Count the row only once.
-            .distinctBy { Pair(it.x, it.y) }
+            // A highlighted glyph, name and role label may be reported more than once. One visual
+            // row always maps to one choice and one click coordinate.
+            .distinctBy { candidate ->
+                if (candidate.hasValidRowBounds()) {
+                    "${candidate.rowLeft},${candidate.rowTop},${candidate.rowRight},${candidate.rowBottom}"
+                } else {
+                    "${candidate.x},${candidate.y}"
+                }
+            }
         }
 
-        internal fun isContactSectionHeader(label: String): Boolean =
-            Regex("^联系人(?:\\s*[（(]?\\d+[）)]?)?$").matches(label.trim())
+        internal fun isContactSectionHeader(label: String): Boolean {
+            val normalized = label.trim().lowercase().replace(" ", "")
+            return Regex("^(?:联系人|contacts?)(?:[（(]?\\d+[）)]?)?$").matches(normalized)
+        }
+
+        internal fun isNonContactSectionHeader(label: String): Boolean {
+            val normalized = label.trim().lowercase().replace(" ", "").replace("_", "")
+            return Regex(
+                "^(?:群聊|群组|聊天记录|网络搜索|搜索网络结果|groups?|groupchats?|chathistory|websearch)(?:[（(]?\\d+[）)]?)?$",
+            ).matches(normalized)
+        }
+
+        internal fun hasBoundContactRoleEvidence(candidate: ContactChoice): Boolean {
+            val role = candidate.rowRoleLabel.trim().lowercase()
+            val roleIsContact = role in setOf("联系人", "好友", "个人", "contact", "contacts", "person")
+            if (!roleIsContact || !candidate.hasValidRowBounds()) return false
+            return candidate.x in candidate.rowLeft..candidate.rowRight &&
+                candidate.y in candidate.rowTop..candidate.rowBottom &&
+                candidate.rowRoleX in candidate.rowLeft..candidate.rowRight &&
+                candidate.rowRoleY in candidate.rowTop..candidate.rowBottom
+        }
+
+        private fun ContactChoice.hasValidRowBounds(): Boolean =
+            rowLeft >= 0 && rowTop >= 0 && rowRight > rowLeft && rowBottom > rowTop
 
         private fun pruneExpiredVisualTransactions() {
             val cutoff = System.currentTimeMillis() - VISUAL_TRANSACTION_TTL_MS
@@ -829,7 +872,19 @@ class SendMessageInAppTool : QuroTool {
                     val label = item.optString("label").trim()
                     val x = item.optInt("action_x", -1)
                     val y = item.optInt("action_y", -1)
-                    ContactChoice(section, label, x, y).takeIf {
+                    ContactChoice(
+                        section = section,
+                        label = label,
+                        x = x,
+                        y = y,
+                        rowRoleLabel = item.optString("row_role_label").trim(),
+                        rowRoleX = item.optInt("row_role_x", -1),
+                        rowRoleY = item.optInt("row_role_y", -1),
+                        rowLeft = item.optInt("row_left", -1),
+                        rowTop = item.optInt("row_top", -1),
+                        rowRight = item.optInt("row_right", -1),
+                        rowBottom = item.optInt("row_bottom", -1),
+                    ).takeIf {
                         label.isNotEmpty() && x in 0 until transaction.screenshotWidth &&
                             y in 0 until transaction.screenshotHeight
                     }
@@ -865,8 +920,8 @@ class SendMessageInAppTool : QuroTool {
                 return captureVisualStage(
                     context,
                     transaction,
-                    "上一张图缺少可验证的联系人标题与候选位置证据。请重新列出每个同名文字命中，" +
-                        "并用 section_headers 列出所有可见分区标题及坐标；本地代码将按最近标题重新归类。",
+                    "上一张图缺少可验证的候选行身份与位置证据。请每个结果行只列一个候选和一个点击中心，" +
+                        "并同时返回分区标题以及同一行内可见的类型文字、坐标和行矩形；本地代码将重新绑定。",
                 )
             } else {
                 visualTransactions.remove(transactionId)
@@ -1025,7 +1080,7 @@ class SendMessageInAppTool : QuroTool {
             VisualStage.VERIFY_SEARCH_FIELD ->
                 "确认当前目标应用已进入全局搜索页，并定位顶部唯一搜索输入框中心；不要定位联系人结果或消息输入框"
             VisualStage.SELECT_CONTACT ->
-                "仅在联系人分区中核对名称精确等于“${transaction.contact}”的联系人；排除群聊分区和聊天记录正文"
+                "核对名称精确等于“${transaction.contact}”且分区或同行类型证据证明为联系人的结果行；排除群聊、聊天记录和网络搜索"
             VisualStage.VERIFY_CONVERSATION ->
                 "确认已经离开搜索结果页：顶部会话名称精确等于“${transaction.contact}”，画面不再显示联系人/群聊/聊天记录结果分区；定位底部唯一消息输入框中心，禁止选择顶部搜索框"
             VisualStage.VERIFY_DRAFT ->
@@ -1151,13 +1206,14 @@ class SendMessageInAppTool : QuroTool {
                 "原样回传 transaction_id、observation_version、resume_stage=verify_search_field、visual_verified=true 和搜索框中心 action_x/action_y。" +
                 "不得调用 input_text、tap_screen、search_and_launch_app 或 activate_app_search；无法确认时 visual_verified=false。"
         VisualStage.SELECT_CONTACT ->
-            "先按最近的分区标题给每一行归类；文字出现次数、字号大小和高亮颜色都不代表联系人数量。" +
-                "只检查‘联系人’或标注为‘联系人’的结果行，禁止把群聊名称、群聊成员命中、聊天记录正文或网络搜索当作联系人。" +
-                "只有联系人分区中恰好一个结果的可见名称与“${transaction.contact}”完全一致时，才调用 send_message_in_app，" +
+            "把每个可点击结果整行作为一个候选；文字出现次数、字号大小和高亮颜色都不代表候选数量。" +
+                "联系人身份必须由最近的联系人分区标题，或候选行矩形内明确可见的联系人类型标签证明；禁止把群聊名称、群成员命中、聊天记录正文或网络搜索当作联系人。" +
+                "只有过滤后恰好一个结果的可见名称与“${transaction.contact}”完全一致时，才调用 send_message_in_app，" +
                 "原样回传 transaction_id、observation_version、resume_stage=select_contact、visual_verified=true 和该结果中心 action_x/action_y。" +
-                "无论你认为有几个联系人，都必须用 candidate_options 列出画面中每个包含同名文字的结果；section 按最近的分区标题分别填写 contact、group、chat_history、web_search 或 other，label 写该行可见文字和区分信息，并返回该行中心 action_x/action_y。" +
+                "无论你认为有几个联系人，都必须用 candidate_options 给画面中每个包含同名文字的可点击结果行只列一个候选；label 写姓名和区分信息，action_x/action_y 是整行点击中心，row_left/top/right/bottom 是整行矩形。" +
+                "若行内明确显示对象类型，row_role_label 必须写可见原文，row_role_x/row_role_y 写该类型文字中心；没有则返回空字符串和 -1。" +
                 "同时必须用 section_headers 按屏幕从上到下列出所有可见分区标题的原文和中心坐标。" +
-                "不要自行省略其他分区的同名命中；本地代码不信任 section 字段，而是按候选上方最近的真实标题重新归类。" +
+                "不要自行省略其他分区的同名命中；本地代码不信任数量或 section 字段，而是按分区、行内证据和几何绑定重新归类。" +
                 "不要再点搜索图标，不要直接调用 tap_screen，不要报告完成。"
         VisualStage.VERIFY_CONVERSATION ->
             "必须确认已离开搜索页，画面不再显示联系人、群聊或聊天记录结果分区；" +

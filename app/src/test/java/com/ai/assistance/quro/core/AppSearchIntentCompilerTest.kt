@@ -22,6 +22,11 @@ class AppSearchIntentCompilerTest {
     fun ordinaryLaunchOrTypingIsNotRewritten() {
         assertNull(AppSearchIntentCompiler.parse("打开微信"))
         assertNull(AppSearchIntentCompiler.parse("在输入框写你好"))
+        assertNull(
+            AppSearchIntentCompiler.parse(
+                "打开微信，查看当前搜索结果。只统计与搜索词完全一致的联系人。不要点击任何结果。",
+            ),
+        )
     }
 
     @Test
