@@ -2,6 +2,20 @@
 
 更新时间：2026-08-31
 
+## p40.34 联系人分区过滤（2026-09-01，优先于下方旧状态）
+
+- 根因已确认：视觉模型对整张搜索页的同名文字命中数量与 `visual_verified` 判断会波动；旧逻辑在模型回传 `visual_verified=true` 时仍可能绕过本地候选过滤，直接采用坐标。
+- `candidate_options` 现在要求每个同名文字命中都携带 `section`：`contact`、`group`、`chat_history`、`web_search` 或 `other`。
+- `SELECT_CONTACT` 阶段不再信任模型声称的数量或 `visual_verified`：本地只保留 `section=contact` 且名称精确匹配的行；同一坐标上的字号/高亮重复命中只计一次。
+- 过滤后恰好一个真实联系人时直接进入；两个以上真实联系人时才生成编号询问；没有可验证联系人时只重新观察一次，随后安全终止。
+- 新增整页混合分区、两个真实联系人及同坐标高亮去重测试。完整 `:app:testFullDebugUnitTest` 共 290 项，0 失败、0 错误；`git diff --check` 通过。
+- 版本：`1.16-p40.34 / 2026082930`；提交 `cca2f4f` 已推送至 `origin/fix/v1.16-p40`。
+- 唯一一次正式构建：GitHub Actions run `33436996962`，结果 `success`。
+- 正式 APK：`E:\LocalAI\downloads\ZorvAI\ZorvAI-v1.16-p40.34-run33436996962\app-full-release.apk`，大小 `287392657` 字节，SHA-256 `CA5D68327328421D7AD9CAF98564A3E843893FC325570905D4CD2BEA5745366B`。
+- APK v2/v3 签名有效，证书 SHA-256 仍为 `7bb02d764febd05e0fca9d7256f90bb17e268def0de0af52a2d13830516aad24`；仅 `arm64-v8a`，35 个 `.so`。
+- 已在设备 `VEG0220924009874` 用 `adb install -r` 保数据覆盖安装；首次安装时间仍为 `2026-08-30 18:31:31`。Zorv/Gotcha 无障碍均真实 Bound，Binding/Crashed 为空；Shizuku server PID `21335` 且 Zorv 授权为 `granted=true`；讯飞仍是默认输入法；安装后无新的 Zorv crash。
+- 验证边界：代码、完整单元测试、唯一正式构建、签名、ABI、保数据安装与离线服务链已完成。尚未在微信真实搜索页做一次“不发送消息”的视觉端到端复测，因此不能宣称真实页面波动问题已最终验收。
+
 ## 工作现场
 
 - 设备：`VEG0220924009874 / p40.30`
