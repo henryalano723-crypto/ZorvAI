@@ -47,6 +47,27 @@ class ExternalUiTargetSessionTest {
     }
 
     @Test
+    fun awaitTrustedSurface_allowsColdLaunchLongerThanDefaultWindow() {
+        val launcher = Any()
+        val target = Any()
+        var samples = 0
+
+        val actual = ExternalUiTargetSession.awaitTrustedSurface(
+            initial = launcher,
+            ownPackage = "com.ai.assistance.quro",
+            targetPackage = "com.tencent.mm",
+            attempts = SendMessageInAppTool.COLD_LAUNCH_SETTLE_ATTEMPTS,
+            packageOf = { if (it === target) "com.tencent.mm" else "com.huawei.android.launcher" },
+            next = {
+                samples += 1
+                if (samples >= 28) target else launcher
+            },
+        )
+
+        assertSame(target, actual)
+    }
+
+    @Test
     fun awaitStableSurface_requiresConsecutiveActiveTargetSamples() {
         val target1 = Any()
         val own = Any()

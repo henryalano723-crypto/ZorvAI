@@ -372,6 +372,10 @@ class SendMessageInAppTool : QuroTool {
     internal data class SectionHeader(val label: String, val x: Int, val y: Int)
 
     companion object {
+        // A cold launch of large apps can spend several seconds on a splash/launcher transition,
+        // especially on Huawei devices. Keep the ordinary foreground check short, but give the
+        // one check immediately following launch enough time to observe a stable target window.
+        internal const val COLD_LAUNCH_SETTLE_ATTEMPTS = 40
         private const val VISUAL_TRANSACTION_TTL_MS = 5 * 60 * 1000L
         private val visualTransactions = ConcurrentHashMap<String, VisualTransaction>()
 
@@ -555,7 +559,10 @@ class SendMessageInAppTool : QuroTool {
         )
         if (!launched.startsWith("已")) return "❌ [打开应用] $launched"
         Thread.sleep(900)
-        var root = ExternalUiTargetSession.rootForAutomation(svc)
+        var root = ExternalUiTargetSession.rootForAutomation(
+            svc,
+            settleAttempts = COLD_LAUNCH_SETTLE_ATTEMPTS,
+        )
             ?: return "❌ [恢复现场] 无法获得目标应用窗口，未执行后续操作"
         val targetPackage = root.packageName?.toString().orEmpty()
 

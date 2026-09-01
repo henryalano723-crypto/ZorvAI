@@ -109,10 +109,11 @@ internal object ExternalUiTargetSession {
         service: QuroAccessibilityService,
         expectedPackage: String,
         initial: AccessibilityNodeInfo? = service.rootInActiveWindow,
+        attempts: Int = FOREGROUND_SETTLE_ATTEMPTS,
     ): AccessibilityNodeInfo? = awaitStableSurface(
         initial = initial,
         expectedPackage = expectedPackage,
-        attempts = FOREGROUND_SETTLE_ATTEMPTS,
+        attempts = attempts,
         requiredConsecutive = FOREGROUND_STABLE_SAMPLES,
         packageOf = { it?.packageName?.toString() },
         next = {
@@ -121,7 +122,10 @@ internal object ExternalUiTargetSession {
         },
     )
 
-    fun rootForAutomation(service: QuroAccessibilityService): AccessibilityNodeInfo? {
+    fun rootForAutomation(
+        service: QuroAccessibilityService,
+        settleAttempts: Int = FOREGROUND_SETTLE_ATTEMPTS,
+    ): AccessibilityNodeInfo? {
         val target = current(service) ?: return service.actionableRoot()
         // actionableRoot() intentionally remembers an external window for automation, so it can
         // legally return a stale target root while Zorv is actually foreground. Only the raw active
@@ -130,7 +134,7 @@ internal object ExternalUiTargetSession {
             initial = service.rootInActiveWindow,
             ownPackage = service.packageName,
             targetPackage = target,
-            attempts = FOREGROUND_SETTLE_ATTEMPTS,
+            attempts = settleAttempts,
             packageOf = { it?.packageName?.toString() },
             next = {
                 Thread.sleep(FOREGROUND_SETTLE_DELAY_MS)
@@ -139,7 +143,7 @@ internal object ExternalUiTargetSession {
         ) ?: return null
         val foreground = root.packageName?.toString()
         if (foreground == target) {
-            return awaitStableActiveRoot(service, target, root)
+            return awaitStableActiveRoot(service, target, root, settleAttempts)
         }
         // Never silently operate on an unrelated external app. The old behaviour accepted any
         // non-Zorv root here, which allowed a stale instruction to click the wrong application.
@@ -154,7 +158,7 @@ internal object ExternalUiTargetSession {
         // returnToHome transitions on Huawei. A plain task promotion is the intended operation.
         runCatching { activityManager.moveTaskToFront(taskId, 0) }
             .getOrElse { return null }
-        return awaitStableActiveRoot(service, target)
+        return awaitStableActiveRoot(service, target, attempts = settleAttempts)
     }
 
     fun returnToOwnApp(service: QuroAccessibilityService): Boolean {
