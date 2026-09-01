@@ -92,6 +92,16 @@ class QuroAccessibilityService : AccessibilityService() {
             if (type == AccessibilityWindowInfo.TYPE_SYSTEM) score -= 5_000
             return score
         }
+
+        internal fun foregroundApplicationWindowScore(
+            type: Int,
+            focused: Boolean,
+            active: Boolean,
+            layer: Int,
+        ): Int? {
+            if (type != AccessibilityWindowInfo.TYPE_APPLICATION || (!focused && !active)) return null
+            return (if (focused) 10_000 else 0) + (if (active) 5_000 else 0) + layer
+        }
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -145,6 +155,30 @@ class QuroAccessibilityService : AccessibilityService() {
             compareBy<Triple<Int, Int, AccessibilityNodeInfo>> { it.first }
                 .thenBy { it.second },
         )?.third ?: rootInActiveWindow
+    }
+
+    /**
+     * Returns only the application window Android currently marks focused or active.
+     *
+     * On some Huawei builds an accessibility overlay can make [rootInActiveWindow] null (or
+     * point at the overlay) even though the underlying app remains the real focused window.
+     * Filtering [windows] by the system focus/active flags preserves that foreground identity
+     * without accepting a stale background application's cached root.
+     */
+    fun foregroundApplicationRoot(): AccessibilityNodeInfo? {
+        val candidates = runCatching {
+            windows.mapNotNull { window ->
+                val score = foregroundApplicationWindowScore(
+                    type = window.type,
+                    focused = window.isFocused,
+                    active = window.isActive,
+                    layer = window.layer,
+                ) ?: return@mapNotNull null
+                val root = window.root ?: return@mapNotNull null
+                score to root
+            }
+        }.getOrDefault(emptyList())
+        return candidates.maxByOrNull { it.first }?.second ?: rootInActiveWindow
     }
 
     override fun onInterrupt() {

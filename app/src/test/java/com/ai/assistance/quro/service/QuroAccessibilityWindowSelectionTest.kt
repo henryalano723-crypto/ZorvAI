@@ -2,6 +2,7 @@ package com.ai.assistance.quro.service
 
 import android.view.accessibility.AccessibilityWindowInfo
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class QuroAccessibilityWindowSelectionTest {
@@ -64,5 +65,36 @@ class QuroAccessibilityWindowSelectionTest {
         )
 
         assertTrue(app > ime)
+    }
+
+    @Test
+    fun foregroundSelectionRejectsStaleBackgroundApplication() {
+        val stale = QuroAccessibilityService.foregroundApplicationWindowScore(
+            type = AccessibilityWindowInfo.TYPE_APPLICATION,
+            focused = false,
+            active = false,
+            layer = 0,
+        )
+
+        assertNull(stale)
+    }
+
+    @Test
+    fun foregroundSelectionAcceptsActiveAppAndRejectsOverlay() {
+        val app = QuroAccessibilityService.foregroundApplicationWindowScore(
+            type = AccessibilityWindowInfo.TYPE_APPLICATION,
+            focused = true,
+            active = true,
+            layer = 0,
+        )
+        val overlay = QuroAccessibilityService.foregroundApplicationWindowScore(
+            type = AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY,
+            focused = true,
+            active = true,
+            layer = 20,
+        )
+
+        assertTrue(app != null)
+        assertNull(overlay)
     }
 }

@@ -108,7 +108,7 @@ internal object ExternalUiTargetSession {
     private fun awaitStableActiveRoot(
         service: QuroAccessibilityService,
         expectedPackage: String,
-        initial: AccessibilityNodeInfo? = service.rootInActiveWindow,
+        initial: AccessibilityNodeInfo? = service.foregroundApplicationRoot(),
         attempts: Int = FOREGROUND_SETTLE_ATTEMPTS,
     ): AccessibilityNodeInfo? = awaitStableSurface(
         initial = initial,
@@ -118,7 +118,7 @@ internal object ExternalUiTargetSession {
         packageOf = { it?.packageName?.toString() },
         next = {
             Thread.sleep(FOREGROUND_SETTLE_DELAY_MS)
-            service.rootInActiveWindow
+            service.foregroundApplicationRoot()
         },
     )
 
@@ -127,18 +127,18 @@ internal object ExternalUiTargetSession {
         settleAttempts: Int = FOREGROUND_SETTLE_ATTEMPTS,
     ): AccessibilityNodeInfo? {
         val target = current(service) ?: return service.actionableRoot()
-        // actionableRoot() intentionally remembers an external window for automation, so it can
-        // legally return a stale target root while Zorv is actually foreground. Only the raw active
-        // window may decide whether a task is ready to receive pixels or input.
+        // Use only the APPLICATION window Android marks focused/active. On Huawei,
+        // rootInActiveWindow can be null while a Zorv overlay is present over WeChat; conversely,
+        // selecting an arbitrary application root could accept a stale background app.
         val root = awaitTrustedSurface(
-            initial = service.rootInActiveWindow,
+            initial = service.foregroundApplicationRoot(),
             ownPackage = service.packageName,
             targetPackage = target,
             attempts = settleAttempts,
             packageOf = { it?.packageName?.toString() },
             next = {
                 Thread.sleep(FOREGROUND_SETTLE_DELAY_MS)
-                service.rootInActiveWindow
+                service.foregroundApplicationRoot()
             },
         ) ?: return null
         val foreground = root.packageName?.toString()
@@ -165,7 +165,7 @@ internal object ExternalUiTargetSession {
         val ownPackage = service.packageName
         // Do not spend the full settle timeout waiting for Zorv when the target app is plainly
         // active. Only perform stability sampling when the first raw root already belongs to Zorv.
-        val initial = service.rootInActiveWindow
+        val initial = service.foregroundApplicationRoot()
         if (initial?.packageName?.toString() == ownPackage) {
             return awaitStableActiveRoot(service, ownPackage, initial) != null
         }
