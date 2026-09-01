@@ -41,6 +41,14 @@ private const val TAG = "QuroLlm"
 private const val MAX_OUTPUT_TOKENS = 131_072
 
 /**
+ * OpenAI 推理模型在 Chat Completions 中要求使用 `max_completion_tokens`，并且部分型号
+ * 不接受自定义 `temperature`。o 系列和 GPT-5 系列统一走该兼容分支；GPT-4o 不是
+ * GPT-5，仍保留原有普通采样参数。
+ */
+internal fun usesOpenAiReasoningChatParameters(model: String): Boolean =
+    Regex("(?i)^(?:o[0-9]|gpt-5(?:[.-]|$))").containsMatchIn(model.trim())
+
+/**
  * 单次 HTTP 调用的硬超时护栏（毫秒）。
  * 作用：OkHttp 自带 connect/read 超时在「代理挂起 / 端点假死」时仍可能长时间不返回，
  * 导致整条对话协程卡在「思考中」、bot 永远不回复且无任何报错（用户感知为「完全没反应」）。
@@ -154,13 +162,13 @@ class QuroLlmClient(
         // 现按规则补全：裸 host → /v1/chat/completions；以 /v1 结尾 → /chat/completions；
         // 已带完整路径则原样；末尾加 '#' 可关闭自动补全（直达原始 URL）。
         val url = completeEndpoint(baseUrl)
-        // 🔧 OpenAI 官方 reasoning 模型（o1 / o3 / o4 系列）硬伤修复：
+        // 🔧 OpenAI 官方 reasoning 模型（o1 / o3 / o4 / GPT-5 系列）硬伤修复：
         //  这类模型**不支持 max_tokens**，必须发 max_completion_tokens，否则直接 400
         //  「max_tokens is not supported with this model」→ 整轮失败（表现为「部分模型直接不回复」，
         //  o 系列全挂，gpt-4o 系列正常）。同时 reasoning 模型**不接收 temperature**
         //  （o1 固定为 1，传非 1 也 400），统一省略由服务端取默认。
-        //  通过 model 名前缀 o+数字（o1 / o3-mini / o4-mini …）识别；gpt-4o / 4.1 等普通模型不受影响。
-        val isReasoningModel = Regex("(?i)^o[0-9]").containsMatchIn(model.trim())
+        //  通过官方模型名前缀识别；gpt-4o / 4.1 等普通模型不受影响。
+        val isReasoningModel = usesOpenAiReasoningChatParameters(model)
         // 🔧 toolfix8：max_tokens 硬性上限护栏。避免误配超大值被上游按「超模型输出上限」500。
         val effectiveMaxTokens = maxTokens.coerceAtMost(MAX_OUTPUT_TOKENS)
         if (effectiveMaxTokens != maxTokens) {
