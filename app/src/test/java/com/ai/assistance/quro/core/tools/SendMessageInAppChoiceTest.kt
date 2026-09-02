@@ -22,6 +22,19 @@ class SendMessageInAppChoiceTest {
     }
 
     @Test
+    fun resolvesASelectedNumberToItsStoredCoordinateWithoutNewVisualCandidates() {
+        val choices = listOf(
+            SendMessageInAppTool.ContactChoice("contact", "张三｜同事", 220, 480),
+            SendMessageInAppTool.ContactChoice("contact", "张三｜客户", 220, 650),
+        )
+
+        assertEquals(choices[0], SendMessageInAppTool.storedContactChoice(choices, 1))
+        assertEquals(choices[1], SendMessageInAppTool.storedContactChoice(choices, 2))
+        assertNull(SendMessageInAppTool.storedContactChoice(choices, 0))
+        assertNull(SendMessageInAppTool.storedContactChoice(choices, 3))
+    }
+
+    @Test
     fun recognizesOnlyExplicitContactSectionLabels() {
         assertEquals(true, SendMessageInAppTool.isExactContactSectionCandidate("灵儿", "contact", "灵儿"))
         assertEquals(true, SendMessageInAppTool.isExactContactSectionCandidate("灵儿", "CONTACT", "灵儿｜微信号尾号 1234"))

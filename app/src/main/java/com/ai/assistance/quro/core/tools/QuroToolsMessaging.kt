@@ -407,14 +407,20 @@ class SendMessageInAppTool : QuroTool {
                     .put("cancel_contact_choice", cancel)
                     .apply {
                         selectedIndex?.let { index ->
-                            val choice = transaction.pendingContactChoices[index]
-                            put("action_x", choice.x)
-                            put("action_y", choice.y)
+                            // Carry only the one-based index. The resume path resolves the point
+                            // again from the transaction's locally stored index -> coordinate map;
+                            // it must not ask the model to reconstruct candidate_options.
+                            put("selected_contact_choice_index", index + 1)
                         }
                     }
                     .toString(),
             )
         }
+
+        internal fun storedContactChoice(
+            choices: List<ContactChoice>,
+            oneBasedIndex: Int,
+        ): ContactChoice? = choices.getOrNull(oneBasedIndex - 1)
 
         internal fun parseContactChoiceIndex(userText: String, labels: List<String>): Int? {
             val text = userText.trim().lowercase().removePrefix("选择").removePrefix("选").trim()
@@ -868,7 +874,21 @@ class SendMessageInAppTool : QuroTool {
             visualTransactions.remove(transactionId)
             return "✅ [MESSAGE_CONTACT_CHOICE_CANCELLED] 已取消本次联系人选择，未输入或发送消息"
         }
-        if (transaction.stage == VisualStage.SELECT_CONTACT) {
+        val storedChoiceIndex = args.optInt("selected_contact_choice_index", 0)
+        val storedChoice = if (transaction.stage == VisualStage.SELECT_CONTACT && storedChoiceIndex > 0) {
+            storedContactChoice(transaction.pendingContactChoices, storedChoiceIndex)
+                ?: return "❌ [选择联系人] 保存的联系人序号无效；未执行点击"
+        } else {
+            null
+        }
+        if (transaction.stage == VisualStage.SELECT_CONTACT && storedChoice != null) {
+            // A user choice is already bound to a coordinate in this exact visual transaction.
+            // Reusing candidate_options here would force another screenshot/model round and could
+            // produce a different candidate list. Resolve locally and continue to the click.
+            args.put("visual_verified", true)
+                .put("action_x", storedChoice.x)
+                .put("action_y", storedChoice.y)
+        } else if (transaction.stage == VisualStage.SELECT_CONTACT) {
             // Never trust the model's count or visual_verified flag for a search result page.
             // Every textual hit must carry a section and local code alone decides which rows are
             // real contacts. This keeps OCR/highlight fluctuations from changing the outcome.

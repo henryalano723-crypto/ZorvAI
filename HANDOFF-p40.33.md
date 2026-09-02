@@ -191,5 +191,20 @@ APK SHA-256：`E45A6429429D97B95BFF9F0BFECBFE68C0B0C4CCA3F28E0FC50868E97AC7F3FB`
 - 真机时间证据显示冷启动后约 2 秒才出现微信目标包窗口；旧 `rootForAutomation` 稳定等待为 `12 × 125ms`，约 1.5 秒，因而会在华为冷启动完成前误判失败。
 - p40.39 采用通用最小修复：`rootForAutomation` 支持调用点传入稳定等待次数；仅 `send_message_in_app` 打开目标 App 后的首次窗口恢复使用 `40 × 125ms`（上限约 5 秒），普通读屏、点击、恢复和后续阶段仍使用原短等待，不写死微信包名或页面坐标。
 - 新增冷启动经历 28 个 launcher 样本后才出现目标窗口的回归测试。定向测试通过；完整 `:app:testFullDebugUnitTest` 共 302 项，0 失败、0 错误；`git diff --check` 仅有 CRLF 提示，无空白错误。
-- 版本已预置为 `versionCode=2026082935`、`versionName=1.16-p40.39`。当前尚未提交、尚未触发 GitHub 正式构建、尚未安装；不得用 p40.38 重试完整发送链路。
-- 下一步：提交并推送 p40.39；仅触发一次正式 GitHub 构建；下载、验签、保数据安装后，在用户已明确给出的同一授权范围内重新执行一次从打开微信到只发送“发错”的完整端到端测试，并核对聊天只新增一条。
+- 版本为 `versionCode=2026082935`、`versionName=1.16-p40.39`；提交 `c21dc1e075e4a3c20ae5bcde4eafd5af306e7d2a` 已推送到 `origin/fix/v1.16-p40`。
+- p40.39 唯一正式 GitHub Actions 构建已成功：Run `33527086923`、Job `99920575837`，18m43s；不得再次触发本版本构建。
+- 正式 APK：`E:\LocalAI\downloads\ZorvAI\ZorvAI-v1.16-p40.39-run33527086923\ZorvAI-v1.16-p40.38-full-release\app-full-release.apk`。内层 artifact 目录名仍为工作流旧标签 p40.38，但 APK 实读版本为 p40.39；大小 `287395450` 字节，SHA-256 `06562FE7521109FF2E72CE33E3D76D7EC47BDEDC52B266B9F1B32A5D6D968CAC`；v2/v3 签名有效，证书 SHA-256 仍为 `7bb02d764febd05e0fca9d7256f90bb17e268def0de0af52a2d13830516aad24`。
+- 当前阻塞：构建完成后设备 `VEG0220924009874` 从 ADB 消失，Windows 也未枚举到华为 USB 设备；首次 p40.39 安装命令在传输前失败，手机仍为 p40.38，应用数据未受影响。
+- 下一步：恢复手机 ADB 连接后用 `adb install --no-streaming -r` 保数据覆盖安装上述 APK，核对 p40.39、无障碍 Bound、讯飞默认输入法及无崩溃；然后在用户已明确给出的同一授权范围内重新执行一次从打开微信到只发送“发错”的完整端到端测试，并核对聊天只新增一条。
+
+## 2026-09-02 p40.41 联系人序号直接绑定已保存坐标
+
+- p40.40 当前源码提交为 `ab8dedb`：目标窗口恢复时优先选择当前聚焦/活动应用窗口，降低系统窗口、输入法窗口干扰。
+- p40.41 把首次搜索结果中生成的联系人编号与坐标冻结在本地 `VisualTransaction.pendingContactChoices` 中。
+- 用户用文字或语音回复 `1/2/...` 时，内部续接调用只携带 `selected_contact_choice_index`；本地代码按序号读取已经保存的坐标，不再要求模型返回 `candidate_options`，也不再因模型重新识别而改变候选数量。
+- 序号无效或超过已保存候选数量时拒绝点击；有效序号通过原目标应用窗口检查后直接进入既有联系人点击与页面变化验证链路。
+- 联系人点击仍需证明页面稳定变化后才会定位消息输入框；正文只允许输入一次，发送动作只派发一次，结果不确定时禁止换通道重复发送。
+- 版本为 `versionCode=2026090202`、`versionName=1.16-p40.41`。
+- 新增“序号解析为本地已保存坐标且不需要新视觉候选”的单元测试；定向测试通过，完整 `:app:testFullDebugUnitTest` 共 305 项，0 失败、0 错误、0 跳过；`git diff --check` 仅有 CRLF 提示，无空白错误。
+- 本节写入时尚未触发 p40.41 正式 GitHub Actions 构建，也尚未安装或完成真机链路验收；正式构建仍只能触发一次。
+- 2026-09-02 15:03 已通过无线 ADB 启动 Shizuku 13.5；设备存在 `shizuku_server` 进程，系统包权限显示 Zorv 的 `moe.shizuku.manager.permission.API_V23: granted=true`。
